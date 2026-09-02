@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VHC Work-to-Action Board</title>
+<!-- React UMD MUST load before the Sigma SDK, even though nothing here uses
+     React: unpkg's @sigmacomputing/plugin UMD factory calls
+     React.createContext() at module-evaluation time, so without a global React
+     it throws mid-load, window.SigmaPlugin is left an empty object and the tile
+     paints nothing with no visible error. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<style>
+  :root {
+    --ink:#1C1228; --ink2:#2A1A3A; --deep:#40016E; --mid:#872A89;
+    --lav:#C6B4EC; --pink:#EA4B94; --grey:#6F646C; --line:#E4DEEC;
+    --muted:#7A7086;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; padding:0; height:100%; background:#FFFFFF;
+              font-family:Inter,-apple-system,"Segoe UI",Roboto,sans-serif;
+              color:var(--ink); -webkit-font-smoothing:antialiased; }
+  #stage { width:100%; height:100%; overflow:hidden; }
+  svg { display:block; }
+  .lbl { font-size:9.5px; letter-spacing:.09em; text-transform:uppercase;
+         fill:var(--muted); font-weight:600; }
+  .veh { font-size:19px; font-weight:700; fill:var(--ink); }
+  .val { font-size:11.5px; font-weight:600; fill:var(--deep); }
+  .leak { font-size:10.5px; font-weight:700; fill:var(--pink); }
+  .leakcap { font-size:8.5px; letter-spacing:.06em; text-transform:uppercase;
+             fill:var(--pink); font-weight:600; opacity:.85; }
+  .chip { font-size:8.5px; letter-spacing:.1em; font-weight:700; fill:#FFFFFF; }
+  .foot { font-size:11px; fill:var(--muted); }
+  .footb { font-size:11px; font-weight:700; fill:var(--ink); }
+  .axis { font-size:9px; fill:var(--muted); }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<script>
+(function () {
+  // window.SigmaPlugin, NOT window.sigmaComputing.plugin -- the UMD bundle
+  // exposes itself flat and the nested form throws on the first line.
+  var SDK = window.SigmaPlugin;
+  var client = SDK && SDK.client;
+  var stage = document.getElementById('stage');
+  var unsub = null;
+  var data = null;
+
+  var STAGE_ORDER_FALLBACK = [
+    'VHC completed', 'Work quoted', 'Customer contacted', 'Authorised',
+    'Parts on order', 'Booked in', 'Invoiced'
+  ];
+
+  // Unbound (editor preview, or a mis-wired config) still has to look right.
+  function synth() {
+    var v = [4712, 3243, 2546, 1866, 1508, 1255, 1037];
+    var m = [1842, 1431, 1084, 794, 688, 605, 558];
+    return STAGE_ORDER_FALLBACK.map(function (s, i) {
+      return { stage: s, order: i + 1, vehicles: v[i], value: m[i] };
+    });
+  }
+
+  function money(k) {
+    if (k >= 1000) return '£' + (k / 1000).toFixed(2) + 'm';
+    return '£' + Math.round(k) + 'k';
+  }
+  function num(n) { return Math.round(n).toLocaleString('en-GB'); }
+
+  function render() {
+    var rows = (data && data.length) ? data : synth();
+    rows = rows.slice().sort(function (a, b) { return a.order - b.order; });
+
+    var W = stage.clientWidth || 1100;
+    var H = stage.clientHeight || 300;
+    if (W < 40 || H < 40) return;
+
+    var PAD_L = 14, PAD_R = 14, PAD_T = 8, PAD_B = 12;
+    var n = rows.length;
+    var slot = (W - PAD_L - PAD_R) / n;
+    var cardW = slot - 10;                     // 10px gutter between cards
+    var cardH = 66;
+    var bandTop = PAD_T + cardH + 26;          // 26px of clearance for leak labels
+    var footH = 22;
+    var yb = H - PAD_B - footH;                // shared funnel baseline
+    var bandH = Math.max(30, yb - bandTop);
+    var footY = H - PAD_B - 5;
+
+    var maxV = Math.max.apply(null, rows.map(function (r) { return r.value; })) || 1;
+    var cx = [], hh = [];
+    for (var i = 0; i < n; i++) {
+      cx.push(PAD_L + i * slot + slot / 2);
+      hh.push((rows[i].value / maxV) * bandH);
+    }
+
+    var leaks = rows.map(function (r, i) {
+      return i === 0 ? 0 : Math.max(0, rows[i - 1].value - r.value);
+    });
+    var worst = 0;
+    for (var i = 1; i < leaks.length; i++) if (leaks[i] > leaks[worst]) worst = i;
+    var totalLeak = leaks.reduce(function (a, b) { return a + b; }, 0);
+    var conv = rows[n - 1].value / (rows[0].value || 1);
+
+    var s = [];
+    s.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H +
+           '" viewBox="0 0 ' + W + ' ' + H + '">');
+    s.push('<defs>' +
+      '<linearGradient id="rib" x1="0" y1="0" x2="1" y2="0">' +
+        '<stop offset="0%" stop-color="#40016E"/>' +
+        '<stop offset="55%" stop-color="#6B1B84"/>' +
+        '<stop offset="100%" stop-color="#A85FBF"/>' +
+      '</linearGradient>' +
+      '<linearGradient id="cardg" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="#FCFAFE"/><stop offset="100%" stop-color="#F2ECFA"/>' +
+      '</linearGradient>' +
+      '<linearGradient id="leakg" x1="0" y1="0" x2="0" y2="1">' +
+        '<stop offset="0%" stop-color="#EA4B94" stop-opacity="0.55"/>' +
+        '<stop offset="100%" stop-color="#EA4B94" stop-opacity="0.06"/>' +
+      '</linearGradient>' +
+      '</defs>');
+
+    // ---- ONE continuous funnel band, tapering through every stage centre.
+    // Drawn as a single polygon rather than per-gap ribbons: separate ribbons
+    // read as seven unrelated bars, which is exactly what a funnel must not do.
+    var top = [];
+    top.push((PAD_L) + ',' + (yb - hh[0]));
+    for (var i = 0; i < n; i++) top.push(cx[i] + ',' + (yb - hh[i]));
+    top.push((W - PAD_R) + ',' + (yb - hh[n - 1]));
+    s.push('<path d="M' + top.join(' L') + ' L' + (W - PAD_R) + ',' + yb +
+           ' L' + PAD_L + ',' + yb + ' Z" fill="url(#rib)"/>');
+
+    // ---- the leak above the band: for each step, the wedge between the
+    // incoming height and the outgoing height.
+    for (var i = 1; i < n; i++) {
+      if (hh[i - 1] - hh[i] < 0.6) continue;
+      s.push('<path d="M' + cx[i - 1] + ',' + (yb - hh[i - 1]) +
+             ' L' + cx[i] + ',' + (yb - hh[i]) +
+             ' L' + cx[i] + ',' + (yb - hh[i - 1]) + ' Z" fill="url(#leakg)"/>');
+      s.push('<line x1="' + cx[i - 1] + '" y1="' + (yb - hh[i - 1]) + '" x2="' + cx[i] +
+             '" y2="' + (yb - hh[i - 1]) + '" stroke="#EA4B94" stroke-width="1" ' +
+             'stroke-dasharray="2 3" opacity="0.7"/>');
+      var lx = (cx[i - 1] + cx[i]) / 2;
+      s.push('<text class="leak" x="' + lx + '" y="' + (yb - hh[i - 1] - 6) +
+             '" text-anchor="middle">-' + money(leaks[i]) + '</text>');
+    }
+
+    // ---- stage cards
+    for (var i = 0; i < n; i++) {
+      var x = PAD_L + i * slot + 5;
+      var hi = (i === worst);
+      s.push('<rect x="' + x + '" y="' + PAD_T + '" width="' + cardW + '" height="' + cardH +
+             '" rx="9" fill="url(#cardg)" stroke="' + (hi ? '#EA4B94' : '#E4DEEC') +
+             '" stroke-width="' + (hi ? 2 : 1) + '"/>');
+      var tx = x + 10;
+      s.push('<text class="lbl" x="' + tx + '" y="' + (PAD_T + 16) + '">' +
+             esc(rows[i].stage) + '</text>');
+      s.push('<text class="veh" x="' + tx + '" y="' + (PAD_T + 39) + '">' +
+             num(rows[i].vehicles) + '</text>');
+      s.push('<text class="val" x="' + tx + '" y="' + (PAD_T + 56) + '">' +
+             money(rows[i].value) + ' identified</text>');
+      // the chip hangs BELOW the card: inside it, it collided with the stage label
+      if (hi) {
+        var chipW = 78, chipX = x + cardW / 2 - chipW / 2;
+        s.push('<rect x="' + chipX + '" y="' + (PAD_T + cardH - 6) + '" width="' + chipW +
+               '" height="15" rx="7.5" fill="#EA4B94"/>');
+        s.push('<text class="chip" x="' + (x + cardW / 2) + '" y="' + (PAD_T + cardH + 4.5) +
+               '" text-anchor="middle">BIGGEST LEAK</text>');
+      }
+      // a tick joining each card to its point on the funnel
+      s.push('<line x1="' + cx[i] + '" y1="' + (PAD_T + cardH + (hi ? 11 : 2)) + '" x2="' + cx[i] +
+             '" y2="' + (yb - hh[i]) + '" stroke="#D9D0E6" stroke-width="1" stroke-dasharray="1 3"/>');
+    }
+
+    // ---- baseline + footer summary
+    s.push('<line x1="' + PAD_L + '" y1="' + yb + '" x2="' + (W - PAD_R) + '" y2="' + yb +
+           '" stroke="#CFC6DD" stroke-width="1"/>');
+    s.push('<text class="footb" x="' + PAD_L + '" y="' + footY + '">' + money(totalLeak) +
+           '</text>');
+    s.push('<text class="foot" x="' + (PAD_L + measure(money(totalLeak)) + 6) + '" y="' + footY +
+           '">of identified work not invoiced this month \u00b7 ' +
+           num(rows[0].vehicles - rows[n - 1].vehicles) +
+           ' vehicles left site with work outstanding</text>');
+    s.push('<text class="foot" x="' + (W - PAD_R) + '" y="' + footY +
+           '" text-anchor="end">value conversion <tspan class="footb">' +
+           (conv * 100).toFixed(1) + '%</tspan></text>');
+    s.push('</svg>');
+    stage.innerHTML = s.join('');
+  }
+
+  function measure(t) { return t.length * 7.2; }   // good enough for one label offset
+  function esc(t) {
+    return String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // ---------------------------------------------------------------- Sigma wiring
+  if (client && client.config) {
+    client.config.configureEditorPanel([
+      { name: 'source', type: 'element' },
+      { name: 'stage', type: 'column', source: 'source', allowedTypes: ['text'], label: 'Stage' },
+      { name: 'order', type: 'column', source: 'source', allowedTypes: ['number'], label: 'Stage order' },
+      { name: 'vehicles', type: 'column', source: 'source', allowedTypes: ['number'], label: 'Vehicles' },
+      { name: 'value', type: 'column', source: 'source', allowedTypes: ['number'], label: 'Value (GBP 000)' }
+    ]);
+
+    client.config.subscribe(function (cfg) {
+      if (unsub) { unsub(); unsub = null; }
+      if (!cfg || !cfg.source) { data = null; render(); return; }
+      unsub = client.elements.subscribeToElementData(cfg.source, function (d) {
+        try {
+          var st = d[cfg.stage] || [], or = d[cfg.order] || [],
+              ve = d[cfg.vehicles] || [], va = d[cfg.value] || [];
+          // The table arrives at (dealership x stage) grain, so roll up by stage.
+          var by = {};
+          for (var i = 0; i < st.length; i++) {
+            var k = st[i];
+            if (!by[k]) by[k] = { stage: k, order: +or[i] || 0, vehicles: 0, value: 0 };
+            by[k].vehicles += +ve[i] || 0;
+            by[k].value += +va[i] || 0;
+          }
+          var out = Object.keys(by).map(function (k) { return by[k]; });
+          data = out.length ? out : null;
+        } catch (e) { data = null; }
+        render();
+      });
+    });
+  }
+
+  // ResizeObserver on the STAGE element, not a window resize listener: the
+  // plugin lives in an iframe Sigma resizes without firing window.resize.
+  if (window.ResizeObserver) new ResizeObserver(render).observe(stage);
+  render();
+})();
+</script>
+</body>
+</html>
