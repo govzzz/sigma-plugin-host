@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plastic Interception Flow</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#FFFFFF;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+               color:#003755; -webkit-font-smoothing:antialiased; }
+  #stage { position:absolute; inset:0; overflow:hidden; }
+  svg { display:block; }
+  .msg { position:absolute; inset:0; display:flex; align-items:center;
+         justify-content:center; font-size:12px; color:#6D8C9C; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<!-- React must load BEFORE the Sigma plugin SDK. The unversioned UMD bundle at
+     unpkg calls React.createContext() at module-evaluation time, so without a
+     global React it throws part-way through the factory, leaves
+     window.SigmaPlugin as an empty object, and the tile renders blank with no
+     visible error -- even for a plugin like this one that never touches React. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  "use strict";
+
+  var NAVY      = "#003755";
+  var NAVY_DEEP = "#01283C";
+  var CYAN      = "#01CBE1";
+  var CYAN_DEEP = "#0A7C90";
+  var SLATE     = "#6D8C9C";
+  var PALE      = "#B3C3CB";
+  var LIGHT     = "#EAF4F8";
+  var GREEN     = "#3FBF74";
+
+  var PROGRAMME_COLOR = {
+    "Rivers":  CYAN,
+    "Coastal": "#7BC0DE",
+    "Oceans":  "#10425F"
+  };
+
+  var stage = document.getElementById("stage");
+
+  // ---- fallback so the tile looks right before it is bound to an element ---
+  function synth() {
+    return [
+      { site: "I-020 Cisadane",       location: "Indonesia",          programme: "Rivers",  tonnes: 3980, capture: 61 },
+      { site: "I-006 Rio Las Vacas",  location: "Guatemala",          programme: "Rivers",  tonnes: 4310, capture: 72 },
+      { site: "I-002 Klang",          location: "Malaysia",           programme: "Rivers",  tonnes: 2640, capture: 58 },
+      { site: "I-001 Cengkareng",     location: "Indonesia",          programme: "Rivers",  tonnes: 2870, capture: 54 },
+      { site: "I-021 Rio Motagua",    location: "Guatemala",          programme: "Rivers",  tonnes: 2870, capture: 66 },
+      { site: "I-010 Kingston Harbour",       location: "Jamaica",            programme: "Rivers",  tonnes: 1840, capture: 63 },
+      { site: "I-005 Klang",          location: "Malaysia",           programme: "Rivers",  tonnes: 1780, capture: 49 },
+      { site: "I-004 Ozama",          location: "Dominican Republic", programme: "Rivers",  tonnes: 1340, capture: 52 },
+      { site: "I-016 Balmagie Gully", location: "Jamaica",            programme: "Rivers",  tonnes: 1120, capture: 47 },
+      { site: "I-022 Rio Abajo",      location: "Panama",             programme: "Rivers",  tonnes:  980, capture: 41 },
+      { site: "I-023 Rio Chamelecon", location: "Honduras",           programme: "Rivers",  tonnes:  760, capture: 38 },
+      { site: "Gulf of Honduras sweep",           location: "Honduras",           programme: "Coastal", tonnes:  180, capture: 12 },
+      { site: "System 03 residual",    location: "North Pacific",      programme: "Oceans",  tonnes:  130, capture:  3 }
+    ];
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function fmt(n) {
+    return Math.round(n).toLocaleString("en-GB");
+  }
+
+  // Column arrays come back keyed by column id. Zip them into row objects,
+  // tolerating a missing optional column rather than throwing.
+  function toRows(data, cfg) {
+    function col(key) {
+      var id = cfg && cfg[key];
+      return (id && data && data[id]) || null;
+    }
+    var site = col("site"), loc = col("location"), prog = col("programme");
+    var ton = col("tonnes"), cap = col("capture");
+    if (!site || !ton) return null;
+    var rows = [];
+    for (var i = 0; i < site.length; i++) {
+      rows.push({
+        site: site[i],
+        location: loc ? loc[i] : "",
+        programme: prog ? prog[i] : "Rivers",
+        tonnes: Number(ton[i]) || 0,
+        capture: cap ? (Number(cap[i]) || 0) : 0
+      });
+    }
+    return rows.length ? rows : null;
+  }
+
+  // ---- the drawing -------------------------------------------------------
+  // A single band of plastic flows left to right. Each site is a gate that
+  // takes a slice out of it; the band narrows by exactly that site's share of
+  // total catch, and what is left at the right-hand edge is the residual still
+  // reaching the ocean. The vertical extent of each gate IS its tonnage, so the
+  // picture and the numbers cannot disagree.
+  function draw(rows, w, h) {
+    if (!rows || !rows.length) {
+      stage.innerHTML = '<div class="msg">No interception sites in the current selection</div>';
+      return;
+    }
+
+    rows = rows.slice().sort(function (a, b) { return b.tonnes - a.tonnes; });
+    var TOP_N = 11;
+    var shown = rows.slice(0, TOP_N);
+    var restT = 0, restN = 0, i;
+    for (i = TOP_N; i < rows.length; i++) { restT += rows[i].tonnes; restN++; }
+    if (restN) {
+      shown.push({ site: "Other sites (" + restN + ")", location: "",
+                   programme: "Rivers", tonnes: restT, capture: 0, isRest: true });
+    }
+
+    var total = 0;
+    for (i = 0; i < rows.length; i++) total += rows[i].tonnes;
+    if (total <= 0) total = 1;
+
+    // Weighted mean capture rate across the deployed sites: what share of the
+    // flow past these gates is actually being stopped. Weighted by tonnage, so
+    // a small site cannot drag the headline the way an unweighted mean would.
+    var capNum = 0, capDen = 0;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].capture > 0) { capNum += rows[i].capture * rows[i].tonnes; capDen += rows[i].tonnes; }
+    }
+    var capture = capDen ? capNum / capDen : 0;
+
+    var PAD_L = 14, PAD_R = 14, PAD_T = 44, PAD_B = 26;
+    var LABEL_W = Math.min(300, Math.max(160, Math.round(w * 0.45)));
+    var VAL_W = 74;
+    var barX = PAD_L + LABEL_W + 8;
+    var barW = Math.max(40, w - barX - VAL_W - PAD_R);
+    var plotH = Math.max(20, h - PAD_T - PAD_B);
+    var n = shown.length;
+    var rowH = plotH / n;
+    var gap = Math.min(3, rowH * 0.22);
+    var barH = Math.max(3, rowH - gap);
+    var fs = rowH < 15 ? 9 : (rowH < 20 ? 10 : 11);
+    // the location sits in its own right-aligned column INSIDE the label gutter;
+    // without reserving it the two strings overprint on every row
+    var showLoc = rowH >= 18 && LABEL_W >= 230;
+    var LOC_W = showLoc ? 104 : 0;   // fits "Dominican Republic" at fs-1
+    var siteW = LABEL_W - LOC_W - 8;
+
+    // no text metrics in a bare SVG string build, so estimate: this font stack
+    // averages ~0.55em per character at these sizes
+    function clip(str, px, size) {
+      var max = Math.max(3, Math.floor(px / (size * 0.55)));
+      return str.length <= max ? str : str.slice(0, max - 1).replace(/[\s\u2014-]+$/, "") + "\u2026";
+    }
+
+    var parts = [];
+    parts.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + w + '" height="' + h +
+               '" viewBox="0 0 ' + w + ' ' + h + '" role="img" ' +
+               'aria-label="Plastic intercepted by deployment site">');
+
+    // gradient for the flow band
+    parts.push('<defs>' +
+      '<linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">' +
+        '<stop offset="0%" stop-color="' + CYAN + '" stop-opacity="0.95"/>' +
+        '<stop offset="100%" stop-color="' + CYAN_DEEP + '" stop-opacity="0.95"/>' +
+      '</linearGradient>' +
+      '<linearGradient id="resid" x1="0" y1="0" x2="1" y2="0">' +
+        '<stop offset="0%" stop-color="' + PALE + '" stop-opacity="0.55"/>' +
+        '<stop offset="100%" stop-color="' + PALE + '" stop-opacity="0.20"/>' +
+      '</linearGradient>' +
+    '</defs>');
+
+    // --- header line: total intercepted + weighted capture rate
+    parts.push('<text x="' + PAD_L + '" y="17" font-size="11" font-weight="700" ' +
+               'letter-spacing="0.6" fill="' + NAVY + '">INTERCEPTED AT SOURCE</text>');
+    parts.push('<text x="' + PAD_L + '" y="34" font-size="19" font-weight="700" ' +
+               'fill="' + NAVY_DEEP + '">' + fmt(total) + '<tspan font-size="11" ' +
+               'font-weight="600" fill="' + SLATE + '"> tonnes</tspan></text>');
+    if (capture > 0) {
+      parts.push('<text x="' + (w - PAD_R) + '" y="17" text-anchor="end" font-size="10" ' +
+                 'font-weight="600" letter-spacing="0.4" fill="' + SLATE +
+                 '">WEIGHTED CAPTURE RATE</text>');
+      parts.push('<text x="' + (w - PAD_R) + '" y="34" text-anchor="end" font-size="17" ' +
+                 'font-weight="700" fill="' + GREEN + '">' + capture.toFixed(0) + '%</text>');
+    }
+    parts.push('<line x1="' + PAD_L + '" y1="' + (PAD_T - 9) + '" x2="' + (w - PAD_R) +
+               '" y2="' + (PAD_T - 9) + '" stroke="' + LIGHT + '" stroke-width="1"/>');
+
+    // --- the narrowing band: each gate removes its slice
+    var remaining = total;
+    for (i = 0; i < shown.length; i++) {
+      var r = shown[i];
+      var y = PAD_T + i * rowH;
+      var frac = remaining / total;                  // width of the band entering this gate
+      var takeFrac = r.tonnes / total;               // the slice this gate removes
+      var enterW = barW * frac;
+      var leaveW = barW * (frac - takeFrac);
+      var color = PROGRAMME_COLOR[r.programme] || CYAN;
+
+      // the whole band entering this gate, drawn pale: this is the flow that
+      // still reaches the ocean if nothing stops it
+      parts.push('<rect x="' + barX + '" y="' + y + '" width="' + Math.max(1, enterW) +
+                 '" height="' + barH + '" rx="1.5" fill="url(#resid)"/>');
+      // ...and the slice this gate removes, at the LEADING edge, so the eye
+      // reads left-to-right as "removed here, the rest continues"
+      var takeW = Math.max(1.5, enterW - Math.max(0, leaveW));
+      parts.push('<rect x="' + barX + '" y="' + y + '" width="' + takeW +
+                 '" height="' + barH + '" rx="1.5" fill="' +
+                 (r.isRest ? SLATE : color) + '" opacity="' + (r.isRest ? 0.5 : 0.92) + '"/>');
+
+      // site label, ellipsized to its own column, with the location beside it
+      var ty = y + barH / 2 + fs * 0.36;
+      parts.push('<text x="' + PAD_L + '" y="' + ty +
+                 '" font-size="' + fs + '" font-weight="600" fill="' + NAVY + '">' +
+                 esc(clip(String(r.site), siteW, fs)) + '</text>');
+      if (r.location && showLoc) {
+        parts.push('<text x="' + (PAD_L + LABEL_W - 2) + '" y="' + ty +
+                   '" text-anchor="end" font-size="' + (fs - 1) + '" fill="' + SLATE +
+                   '">' + esc(clip(String(r.location), LOC_W, fs - 1)) + '</text>');
+      }
+
+      // tonnes, and the site's own capture rate where there is room
+      parts.push('<text x="' + (w - PAD_R) + '" y="' + (y + barH / 2 + fs * 0.36) +
+                 '" text-anchor="end" font-size="' + fs + '" font-weight="700" fill="' +
+                 NAVY_DEEP + '">' + fmt(r.tonnes) +
+                 (r.capture > 0 && rowH >= 16
+                   ? '<tspan font-size="' + (fs - 1) + '" font-weight="600" fill="' +
+                     SLATE + '">  ' + r.capture + '%</tspan>'
+                   : '') +
+                 '</text>');
+
+      remaining -= r.tonnes;
+    }
+
+    // --- footer: what is still getting past
+    var caption = capture > 0
+      ? "Band width is the flow still heading for the ocean; the solid block is what this site removes"
+      : "Catch by deployment site";
+    // clip the caption too -- at narrow widths it ran off the right edge
+    parts.push('<text x="' + PAD_L + '" y="' + (h - 8) + '" font-size="9.5" fill="' +
+               SLATE + '">' + esc(clip(caption, w - PAD_L - PAD_R, 9.5)) + '</text>');
+    parts.push('</svg>');
+    stage.innerHTML = parts.join("");
+  }
+
+  // ---- wiring ------------------------------------------------------------
+  var rows = synth();
+
+  function render() {
+    var r = stage.getBoundingClientRect();
+    draw(rows, Math.max(240, Math.round(r.width)), Math.max(140, Math.round(r.height)));
+  }
+
+  // ResizeObserver on the STAGE, not a window resize listener: the plugin lives
+  // in an iframe that Sigma resizes without firing a window resize event.
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(render).observe(stage);
+  } else {
+    window.addEventListener("resize", render);
+  }
+  render();
+
+  // window.SigmaPlugin -- the UMD bundle exposes itself flat, there is no
+  // window.sigmaComputing.plugin nesting (that shape throws on the first line
+  // and the tile never paints).
+  var SP = window.SigmaPlugin;
+  if (!SP || !SP.client) return;    // unbound preview: keep the synth fallback
+  var client = SP.client;
+
+  client.config.configureEditorPanel([
+    { name: "source", type: "element" },
+    { name: "site", type: "column", source: "source", allowedTypes: ["text"], label: "Site" },
+    { name: "location", type: "column", source: "source", allowedTypes: ["text"], label: "Location" },
+    { name: "programme", type: "column", source: "source", allowedTypes: ["text"], label: "Programme" },
+    { name: "tonnes", type: "column", source: "source", allowedTypes: ["number"], label: "Tonnes" },
+    { name: "capture", type: "column", source: "source", allowedTypes: ["number"], label: "Capture %" }
+  ]);
+
+  var unsub = null;
+  client.config.subscribe(function (cfg) {
+    if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
+    if (!cfg || !cfg.source) { rows = synth(); render(); return; }
+    unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
+      var next = toRows(data, cfg);
+      rows = next || synth();
+      render();
+    });
+  });
+})();
+</script>
+</body>
+</html>
