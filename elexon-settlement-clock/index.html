@@ -244,16 +244,23 @@
     // A good synth fallback looks exactly like real data, which is what makes
     // a mis-bound column invisible -- so say which one is on screen. Without
     // this, a render showing the synth shape reads as a successful bind.
-    if (!bound) {
+    if (state !== "bound") {
       s.push('<text x="' + (W - 6) + '" y="10" text-anchor="end" font-size="7.5" '
-             + 'fill="' + PALE + '" letter-spacing="0.6">SAMPLE SHAPE — NOT BOUND</text>');
+             + 'fill="' + PALE + '" letter-spacing="0.6">SAMPLE SHAPE — '
+             + state.toUpperCase() + (diag ? " (" + diag + ")" : "") + '</text>');
     }
     s.push('</svg>');
     stage.innerHTML = s.join("");
   }
 
   var rows = synth();
-  var bound = false;
+  // Three states, not two: "no config" (the editor panel was never filled in),
+  // "config but no rows yet" (subscribed, data has not arrived or the column
+  // keys did not match) and bound. A single bound/unbound flag could not tell
+  // the first two apart, and that is exactly the distinction you need when a
+  // correctly-wired plugin still shows the sample shape.
+  var state = "no config";
+  var diag = "";
 
   function render() {
     var r = stage.getBoundingClientRect();
@@ -290,11 +297,21 @@
   var unsub = null;
   client.config.subscribe(function (cfg) {
     if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
-    if (!cfg || !cfg.source) { rows = synth(); bound = false; render(); return; }
+    if (!cfg || !cfg.source) {
+      state = "no config"; diag = ""; rows = synth(); render(); return;
+    }
+    state = "awaiting data"; diag = ""; render();
     unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
       var next = toRows(data, cfg);
-      bound = !!(next && next.length);
-      rows = bound ? next : synth();
+      if (next && next.length) {
+        state = "bound"; diag = ""; rows = next;
+      } else {
+        // name what actually arrived: if the keys are not the configured
+        // column ids, the tile looks identical to a slow load
+        state = "no rows";
+        diag = data ? Object.keys(data).slice(0, 4).join(",") : "no data";
+        rows = synth();
+      }
       render();
     });
   });
