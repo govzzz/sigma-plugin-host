@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Half-Hourly Settlement Clock</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#FFFFFF;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+               color:#000081; -webkit-font-smoothing:antialiased; }
+  #stage { position:absolute; inset:0; overflow:hidden; }
+  svg { display:block; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+
+<!-- React must load BEFORE the Sigma plugin SDK. The unversioned UMD bundle at
+     unpkg calls React.createContext() at module-evaluation time, so without a
+     global React it throws part-way through the factory, leaves
+     window.SigmaPlugin as an empty object, and the tile renders blank with no
+     visible error -- even for a plugin like this one that never touches React. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  "use strict";
+
+  // Elexon's own palette, sampled from themes/elexon-vision/css/layout.css
+  var DEEP   = "#000081";   // brand deep blue, 86 uses on their site
+  var BRIGHT = "#0091FF";   // their bright blue
+  var GREEN  = "#01C05A";   // their electric green, darkened to carry text
+  var SLATE  = "#6B7A99";
+  var PALE   = "#C7D4EA";
+  var LIGHT  = "#EEF3FB";
+  var SHORT  = "#B0006B";   // under-notified (system short)
+  var LONG   = "#00738F";   // over-notified (system long)
+
+  var stage = document.getElementById("stage");
+
+  // --- the fallback shape ---------------------------------------------------
+  // A plugin must look right UNBOUND, or the editor panel is impossible to
+  // configure and a mis-wired column reads as a broken tile rather than as a
+  // mis-wired column. This is the GB half-hourly demand shape: overnight
+  // trough around period 8 (03:30), evening peak around period 36 (17:30).
+  function synth() {
+    var out = [];
+    for (var i = 0; i < 48; i++) {
+      var t = i / 48 * 2 * Math.PI;
+      var base = 25.5 - 6.4 * Math.cos(t - 0.55) + 3.1 * Math.sin(2 * t - 1.1);
+      var fc = base + (i % 7 - 3) * 0.09;
+      out.push({
+        period: i + 1,
+        clock: pad(Math.floor(i / 2)) + ":" + (i % 2 ? "30" : "00"),
+        consumption: round(base, 1),
+        forecast: round(fc, 1),
+        price: round(28 + (base - 18) * 6.1, 2)
+      });
+    }
+    return out;
+  }
+
+  function pad(n) { return (n < 10 ? "0" : "") + n; }
+  function round(v, d) { var m = Math.pow(10, d); return Math.round(v * m) / m; }
+  function fmt(v, d) {
+    return (v == null || isNaN(v)) ? "—" :
+      v.toFixed(d).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+
+  // --- data binding --------------------------------------------------------
+  function toRows(data, cfg) {
+    if (!data) return null;
+    function col(key) { return cfg[key] ? data[cfg[key]] : null; }
+    var per = col("period"), clk = col("clock"), con = col("consumption"),
+        fcs = col("forecast"), prc = col("price");
+    if (!con || !con.length) return null;
+    var out = [];
+    for (var i = 0; i < con.length; i++) {
+      out.push({
+        period: per ? Number(per[i]) : i + 1,
+        clock: clk ? String(clk[i]) : "",
+        consumption: Number(con[i]),
+        forecast: fcs ? Number(fcs[i]) : Number(con[i]),
+        price: prc ? Number(prc[i]) : null
+      });
+    }
+    out.sort(function (a, b) { return a.period - b.period; });
+    return out;
+  }
+
+  // Sequential ramp on system price: light = cheap, brand deep blue = dear.
+  // One quantity per channel -- radius carries consumption, colour carries
+  // price, and the notch carries the notified position, so nothing is doing
+  // double duty.
+  var RAMP = ["#DCE7F8", "#A8C4EE", "#6E9BE0", "#3A72D2", "#0F49B4", "#000081"];
+
+  function priceColor(p, lo, hi) {
+    if (p == null || isNaN(p) || hi <= lo) return PALE;
+    var t = (p - lo) / (hi - lo);
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    var i = t * (RAMP.length - 1);
+    return RAMP[Math.round(i)];
+  }
+
+  function draw(rows, W, H) {
+    var s = [];
+    // The legend band has to be tall enough for TWO lines plus the 12:00 clock
+    // label that sits below the dial: at LEGEND_H 30 the label, the ramp
+    // caption and the imbalance callout all landed on top of each other at
+    // 380x300.
+    var PADT = 6, LEGEND_H = 42;
+    var cx = W / 2, cy = (H - LEGEND_H) / 2 + PADT;
+    var outer = Math.max(40, Math.min(cx, cy) - 18);
+    var inner = outer * 0.42;
+
+    var cons = rows.map(function (r) { return r.consumption; });
+    var fcst = rows.map(function (r) { return r.forecast; });
+    var prices = rows.map(function (r) { return r.price; })
+                     .filter(function (p) { return p != null && !isNaN(p); });
+    var vmax = Math.max.apply(null, cons.concat(fcst)) * 1.02;
+    var vmin = 0;
+    var plo = prices.length ? Math.min.apply(null, prices) : 0;
+    var phi = prices.length ? Math.max.apply(null, prices) : 1;
+
+    function radius(v) {
+      var t = (v - vmin) / (vmax - vmin);
+      return inner + (outer - inner) * (t < 0 ? 0 : t > 1 ? 1 : t);
+    }
+    // Settlement Period 1 starts at 00:00, which sits at the TOP of the clock,
+    // and the day runs clockwise -- so -90deg is midnight.
+    var n = rows.length || 48;
+    var step = 2 * Math.PI / n;
+    function ang(i) { return -Math.PI / 2 + i * step; }
+    function pt(a, r) {
+      return [round(cx + Math.cos(a) * r, 2), round(cy + Math.sin(a) * r, 2)];
+    }
+    var peakVal = Math.max.apply(null, cons);
+
+    s.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H +
+           '" viewBox="0 0 ' + W + ' ' + H + '">');
+
+    // hour rings + the four cardinal clock labels
+    s.push('<circle cx="' + cx + '" cy="' + cy + '" r="' + round(inner, 2) +
+           '" fill="' + LIGHT + '" stroke="' + PALE + '" stroke-width="1"/>');
+
+    var gap = step * 0.16;
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var a0 = ang(i) + gap / 2, a1 = ang(i) + step - gap / 2;
+      var rr = radius(r.consumption);
+      var p0 = pt(a0, inner), p1 = pt(a1, inner);
+      var q0 = pt(a0, rr), q1 = pt(a1, rr);
+      s.push('<path d="M' + p0[0] + ' ' + p0[1] +
+             ' A' + round(inner, 2) + ' ' + round(inner, 2) + ' 0 0 1 ' + p1[0] + ' ' + p1[1] +
+             ' L' + q1[0] + ' ' + q1[1] +
+             ' A' + round(rr, 2) + ' ' + round(rr, 2) + ' 0 0 0 ' + q0[0] + ' ' + q0[1] +
+             ' Z" fill="' + priceColor(r.price, plo, phi) + '"/>');
+
+      // the notified position, as a tick at the forecast radius: where the tick
+      // sits INSIDE the wedge the system is short, outside and it is long
+      var fr = radius(r.forecast);
+      var f0 = pt(a0 + gap * 0.2, fr), f1 = pt(a1 - gap * 0.2, fr);
+      var d = r.consumption - r.forecast;
+      s.push('<path d="M' + f0[0] + ' ' + f0[1] + ' A' + round(fr, 2) + ' ' +
+             round(fr, 2) + ' 0 0 1 ' + f1[0] + ' ' + f1[1] +
+             '" fill="none" stroke="' + (d > 0 ? SHORT : LONG) +
+             '" stroke-width="' + (Math.abs(d) > 0.25 ? 2 : 1.1) +
+             '" stroke-opacity="' + (Math.abs(d) > 0.25 ? 0.95 : 0.45) + '"/>');
+    }
+
+    // clock labels at 00:00 / 06:00 / 12:00 / 18:00
+    var marks = [[0, "00:00"], [n / 4, "06:00"], [n / 2, "12:00"], [3 * n / 4, "18:00"]];
+    for (var m = 0; m < marks.length; m++) {
+      var a = ang(marks[m][0]);
+      var lp = pt(a, outer + 9);
+      s.push('<text x="' + lp[0] + '" y="' + (lp[1] + 3) +
+             '" text-anchor="middle" font-size="9" fill="' + SLATE +
+             '" letter-spacing="0.4">' + marks[m][1] + '</text>');
+    }
+
+    // centre readout, tiered by the radius actually available. Four lines
+    // overflowed the inner disc at 620x360 and collided with the wedges at
+    // 380x300 -- and text crossing a dark wedge is unreadable, so nothing here
+    // may exceed `inner`.
+    var total = cons.reduce(function (a, b) { return a + b; }, 0);
+    var pk = 0, im = 0;
+    for (var k = 0; k < rows.length; k++) {
+      if (rows[k].consumption > rows[pk].consumption) pk = k;
+      if (Math.abs(rows[k].consumption - rows[k].forecast) >
+          Math.abs(rows[im].consumption - rows[im].forecast)) im = k;
+    }
+    var idelta = rows[im].consumption - rows[im].forecast;
+    var big = Math.max(13, Math.min(24, inner * 0.34));
+    var dy = inner > 58 ? -4 : 5;
+    if (inner > 58) {
+      s.push('<text x="' + cx + '" y="' + round(cy + dy - big, 1) +
+             '" text-anchor="middle" font-size="9" fill="' + SLATE +
+             '" letter-spacing="0.8">SETTLED TODAY</text>');
+    }
+    s.push('<text x="' + cx + '" y="' + round(cy + dy, 1) +
+           '" text-anchor="middle" font-size="' + round(big, 1) +
+           '" font-weight="600" fill="' + DEEP + '">' + fmt(total, 0) + ' GWh</text>');
+    if (inner > 52) {
+      s.push('<text x="' + cx + '" y="' + round(cy + dy + big * 0.82, 1) +
+             '" text-anchor="middle" font-size="9" fill="' + SLATE + '">peak SP ' +
+             rows[pk].period + ' · ' + rows[pk].clock + '</text>');
+    }
+
+    // legend: the price ramp, then the two imbalance directions
+    var ly = H - 12, lx = 14, sw = Math.min(15, (W - 210) / RAMP.length);
+    if (sw > 5) {
+      s.push('<text x="' + lx + '" y="' + (ly - 12) +
+             '" font-size="8.5" fill="' + SLATE + '" letter-spacing="0.5">SYSTEM PRICE £/MWh</text>');
+      for (var g = 0; g < RAMP.length; g++) {
+        s.push('<rect x="' + (lx + g * sw) + '" y="' + (ly - 8) + '" width="' +
+               round(sw, 1) + '" height="8" fill="' + RAMP[g] + '"/>');
+      }
+      s.push('<text x="' + lx + '" y="' + (ly + 9) + '" font-size="8.5" fill="' +
+             SLATE + '">' + fmt(plo, 0) + '</text>');
+      s.push('<text x="' + round(lx + RAMP.length * sw, 1) + '" y="' + (ly + 9) +
+             '" text-anchor="end" font-size="8.5" fill="' + SLATE + '">' +
+             fmt(phi, 0) + '</text>');
+
+      if (W > 520) s.push('<text x="' + round(cx, 1) + '" y="' + (ly - 1) +
+             '" text-anchor="middle" font-size="9" fill="' +
+             (idelta > 0 ? SHORT : LONG) + '">largest imbalance SP ' +
+             rows[im].period + ' · ' + (idelta > 0 ? '+' : '') +
+             fmt(idelta, 1) + ' GWh</text>');
+      var rx = W - 14;
+      s.push('<text x="' + rx + '" y="' + (ly - 12) +
+             '" text-anchor="end" font-size="8.5" fill="' + SLATE +
+             '" letter-spacing="0.5">VS NOTIFIED POSITION</text>');
+      s.push('<line x1="' + (rx - 128) + '" y1="' + (ly - 4) + '" x2="' + (rx - 112) +
+             '" y2="' + (ly - 4) + '" stroke="' + SHORT + '" stroke-width="2"/>');
+      s.push('<text x="' + (rx - 107) + '" y="' + (ly - 1) + '" font-size="8.5" fill="' +
+             SLATE + '">short</text>');
+      s.push('<line x1="' + (rx - 62) + '" y1="' + (ly - 4) + '" x2="' + (rx - 46) +
+             '" y2="' + (ly - 4) + '" stroke="' + LONG + '" stroke-width="2"/>');
+      s.push('<text x="' + (rx - 41) + '" y="' + (ly - 1) + '" font-size="8.5" fill="' +
+             SLATE + '">long</text>');
+    }
+
+    s.push('</svg>');
+    stage.innerHTML = s.join("");
+  }
+
+  var rows = synth();
+
+  function render() {
+    var r = stage.getBoundingClientRect();
+    draw(rows, Math.max(260, Math.round(r.width)), Math.max(180, Math.round(r.height)));
+  }
+
+  // ResizeObserver on the STAGE, not a window resize listener: the plugin lives
+  // in an iframe that Sigma resizes without firing a window resize event. And
+  // no animation loop anywhere -- a headless PNG export never reaches idle on a
+  // plugin that animates, which is what qa_pg1.py exists to work around.
+  if (typeof ResizeObserver === "function") {
+    new ResizeObserver(render).observe(stage);
+  } else {
+    window.addEventListener("resize", render);
+  }
+  render();
+
+  // window.SigmaPlugin -- the UMD bundle exposes itself FLAT. The
+  // window.sigmaComputing.plugin shape in the docs throws on the first line
+  // and the tile never paints.
+  var SP = window.SigmaPlugin;
+  if (!SP || !SP.client) return;    // unbound preview: keep the synth fallback
+  var client = SP.client;
+
+  client.config.configureEditorPanel([
+    { name: "source", type: "element" },
+    { name: "period", type: "column", source: "source", allowedTypes: ["number"], label: "Settlement Period" },
+    { name: "clock", type: "column", source: "source", allowedTypes: ["text"], label: "Clock Time" },
+    { name: "consumption", type: "column", source: "source", allowedTypes: ["number"], label: "Consumption GWh" },
+    { name: "forecast", type: "column", source: "source", allowedTypes: ["number"], label: "Forecast GWh" },
+    { name: "price", type: "column", source: "source", allowedTypes: ["number"], label: "System Price" }
+  ]);
+
+  var unsub = null;
+  client.config.subscribe(function (cfg) {
+    if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
+    if (!cfg || !cfg.source) { rows = synth(); render(); return; }
+    unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
+      var next = toRows(data, cfg);
+      rows = next && next.length ? next : synth();
+      render();
+    });
+  });
+})();
+</script>
+</body>
+</html>
