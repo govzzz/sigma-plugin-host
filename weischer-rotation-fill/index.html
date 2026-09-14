@@ -325,9 +325,17 @@
   if (window.ResizeObserver) new ResizeObserver(render).observe(stage);
   render();
 
-  var SDK = window.SigmaPlugin || window.sigmaComputing;
-  if (!SDK || !SDK.plugin) { state = "SDK not loaded"; render(); return; }
-  var client = SDK.plugin.client;
+  // The UMD bundle exposes itself FLAT on window.SigmaPlugin: its exports are
+  // `client`, `SigmaClientProvider`, `polyfillRequestAnimationFrame` and the
+  // React hooks. There is NO `plugin` property, so the
+  // `window.sigmaComputing.plugin.client` shape in the docs -- and
+  // `SigmaPlugin.plugin.client` -- are both undefined, the reference throws on
+  // the first line, and the tile paints the unbound fallback for ever while
+  // looking almost right. The `.plugin.client` path is kept only as a fallback
+  // in case an older bundle is ever pinned.
+  var SP = window.SigmaPlugin || window.sigmaComputing;
+  var client = SP && (SP.client || (SP.plugin && SP.plugin.client));
+  if (!client) { state = "SDK not loaded"; render(); return; }
 
   client.config.configureEditorPanel([
     { name: "source", type: "element" },
