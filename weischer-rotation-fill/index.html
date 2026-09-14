@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rotation Fill</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#FFFFFF;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+               color:#2B0A1C; -webkit-font-smoothing:antialiased; }
+  #stage { position:absolute; inset:0; overflow:hidden; }
+  svg { display:block; }
+  #tip { position:absolute; pointer-events:none; opacity:0; transition:opacity .08s;
+         background:#2B0A1C; color:#fff; font-size:11px; line-height:1.35;
+         padding:6px 8px; border-radius:6px; white-space:nowrap; z-index:5;
+         box-shadow:0 4px 14px rgba(0,0,0,.28); }
+  #tip b { font-weight:700; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="tip"></div>
+
+<!-- React must load BEFORE the Sigma plugin SDK. The unversioned UMD bundle at
+     unpkg calls React.createContext() at module-evaluation time, so without a
+     global React it throws part-way through the factory, leaves
+     window.SigmaPlugin as an empty object, and the tile renders blank with no
+     visible error -- even for a plugin like this one that never touches React. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  "use strict";
+
+  // Weischer's own palette. Their stylesheet (themes/weischer/assets/css/
+  // variables.css) is deliberately monochrome -- the brand colour lives in the
+  // per-division BUTTON BACKGROUND IMAGES the theme swaps in, so these four
+  // hexes are pixel-sampled from weischer-button-bg-dach.png (#731E55 plum ->
+  // #F29100 orange) and weischer-button-bg-cinema.png (#E20034 red -> #F6AA81
+  // peach). Not guessed.
+  var INK   = "#2B0A1C";
+  var RED   = "#E20034";   // brand red  -- the cinema division's own colour
+  var PLUM  = "#731E55";   // brand plum -- the group colour
+  var ORNG  = "#F29100";   // brand orange
+  var LILAC = "#B5628F";
+  var GREY  = "#7C7077";
+  var HAIR  = "#E7E1E4";
+  var EMPTY = "#FBF7F8";   // an unsold frame: visibly EMPTY, not a colour
+  var EDGE  = "#D8CED3";
+  // The film stock itself. NOT the ink: at INK (#2B0A1C) the brand plum used
+  // for Regional bookings sat only a shade off the body it was printed on, so
+  // a third of a strip read as unbooked when it was sold. A lifted, desaturated
+  // plum-grey keeps it reading as film while separating every tier from it.
+  var STOCK = "#3A2A33";
+
+  // One colour per booking tier. The whole point of the tile is that you can
+  // see WHAT is in the rotation and, more importantly, what ISN'T.
+  var TIER_FILL = {
+    "National": RED, "Regional": PLUM, "Local": ORNG,
+    "Programmatic": LILAC, "Unsold": EMPTY
+  };
+  var TIER_ORDER = ["National", "Regional", "Local", "Programmatic", "Unsold"];
+
+  var stage = document.getElementById("stage");
+  var tip = document.getElementById("tip");
+
+  // --- the fallback shape ---------------------------------------------------
+  // A plugin has to look right UNBOUND, or the editor panel is impossible to
+  // configure and a mis-wired column reads as a broken tile rather than as a
+  // mis-wired column. This reproduces rotation_fill_sql's own eight rotations
+  // so the layout can be judged before anything is bound.
+  var SYNTH = [
+    ["Berlin Premium · Mon–Thu pre-show", "Cinema reel", "Berlin", 30,
+     "N Deutsche Telekom|N Audi|N Coca-Cola|R Berliner Sparkasse|N Netflix|U |R BVG|L Fitness First Mitte|U |N Jägermeister|R Vattenfall|U |L Autohaus Weber|N Sixt|U |P Programmatic fill"],
+    ["München Blockbuster · Fri–Sun pre-show", "Cinema reel", "München", 30,
+     "N BMW|N Apple|N Coca-Cola|N Paulaner|R Stadtsparkasse München|N Netflix|N Nike|R MVG|N Jägermeister|L Kaufhaus Rosenheim|N Sixt|N Deutsche Telekom|R Allianz|L Zahnklinik Schwabing|U |P Programmatic fill"],
+    ["Rest of Germany Local · Mon–Thu pre-show", "Cinema reel", "Rest of Germany", 30,
+     "N Deutsche Telekom|L Möbelhaus Kröger|U |R Volksbank|L Fahrschule Lenz|U |N Coca-Cola|L Pizzeria Vesuvio|U |L Bäckerei Thiele|U |R Stadtwerke|U |L Optik Sommer|U |U "],
+    ["Zürich & CH Premium · all week", "Cinema reel", "Zürich", 30,
+     "N Swisscom|N Migros|N UBS|R ZVV|N Coca-Cola|N Rivella|U |R Zürich Tourismus|N Netflix|L Fitnesspark Sihlcity|U |N Swiss|R Baloise|U |P Programmatic fill|P Programmatic fill"],
+    ["Hamburg Hbf Station Loop · 120s", "DOOH loop", "Hamburg", 10,
+     "P Zalando|N Deutsche Bahn|P Lieferando|R Haspa|P Amazon|N Congstar|P Flink|R Hamburger Hochbahn|P Douglas|N IKEA|P Booking.com|U "],
+    ["Berlin Retail & Mall Loop · 120s", "DOOH loop", "Berlin", 10,
+     "P Zalando|N Samsung|P Douglas|P About You|R Berliner Sparkasse|N Lidl|P Temu|P Deichmann|N Coca-Cola|P Shein|U |U "],
+    ["Rhein-Main Roadside Loop · 120s", "DOOH loop", "Rhein-Main", 10,
+     "N Fraport|P Sixt|N Opel|R Frankfurter Sparkasse|P McDonald's|U |N Congstar|P Shell|U |R Mainova|U |P Programmatic fill"],
+    ["Wien Transit Loop · 120s", "DOOH loop", "Wien", 10,
+     "N A1 Telekom|P Billa|N ÖBB|R Wiener Linien|P Willhaben|N Red Bull|P Interspar|R Wien Energie|N Netflix|P Bipa|U |P Programmatic fill"]
+  ];
+  var LETTER = { N: "National", R: "Regional", L: "Local",
+                 P: "Programmatic", U: "Unsold" };
+
+  function synth() {
+    var out = [];
+    SYNTH.forEach(function (r) {
+      r[4].split("|").forEach(function (cell, i) {
+        var tier = LETTER[cell.charAt(0)];
+        var adv = cell.slice(2) || "—";
+        out.push({ rotation: r[0], type: r[1], market: r[2], seconds: r[3],
+                   slot: i, tier: tier, advertiser: adv });
+      });
+    });
+    return out;
+  }
+
+  // --- data ----------------------------------------------------------------
+  function toRows(data, cfg) {
+    if (!data || !cfg) return null;
+    var c = [cfg.rotation, cfg.type, cfg.market, cfg.slot, cfg.seconds,
+             cfg.tier, cfg.advertiser];
+    for (var i = 0; i < c.length; i++) if (!c[i] || !data[c[i]]) return null;
+    var n = data[c[0]].length, out = [];
+    for (var j = 0; j < n; j++) {
+      out.push({
+        rotation: String(data[cfg.rotation][j]),
+        type: String(data[cfg.type][j]),
+        market: String(data[cfg.market][j]),
+        // Slot is carried as an explicit INTEGER by rotation_fill_sql for
+        // exactly this reason: ordering frames by a DATE column gets epoch
+        // milliseconds on one path and an ISO string on the other.
+        slot: Number(data[cfg.slot][j]),
+        seconds: Number(data[cfg.seconds][j]),
+        tier: String(data[cfg.tier][j]),
+        advertiser: String(data[cfg.advertiser][j])
+      });
+    }
+    return out;
+  }
+
+  function group(rows) {
+    var map = {}, order = [];
+    rows.forEach(function (r) {
+      if (!map[r.rotation]) { map[r.rotation] = { name: r.rotation, type: r.type,
+                                                  market: r.market,
+                                                  seconds: r.seconds, slots: [] };
+                              order.push(r.rotation); }
+      map[r.rotation].slots.push(r);
+    });
+    return order.map(function (k) {
+      var g = map[k];
+      g.slots.sort(function (a, b) { return a.slot - b.slot; });
+      var sold = 0;
+      g.slots.forEach(function (s) { if (s.tier !== "Unsold") sold++; });
+      g.sold = sold;
+      g.fill = g.slots.length ? sold / g.slots.length : 0;
+      g.unsoldSecs = (g.slots.length - sold) * g.seconds;
+      return g;
+    });
+  }
+
+  // --- render ---------------------------------------------------------------
+  var rows = synth(), state = "no config", diag = "";
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;");
+  }
+
+  function render() {
+    var W = stage.clientWidth || 900, H = stage.clientHeight || 420;
+    var gs = group(rows);
+    if (!gs.length) { stage.innerHTML = ""; return; }
+
+    var PAD = 14, HEAD = 40;
+    // the label column takes a share of the width, floored and capped so a
+    // narrow tile does not squeeze the strips to nothing and a wide one does
+    // not strand them
+    var LBL = Math.max(126, Math.min(250, Math.round(W * 0.27)));
+    var MET = Math.max(74, Math.min(104, Math.round(W * 0.11)));
+    var stripX = PAD + LBL + 10;
+    var stripW = Math.max(60, W - stripX - MET - PAD);
+    var avail = H - HEAD - PAD;
+    var rowH = Math.max(22, Math.min(52, avail / gs.length));
+    var totalSlots = 0, totalSold = 0, unsoldSecs = 0;
+    gs.forEach(function (g) {
+      totalSlots += g.slots.length; totalSold += g.sold;
+      unsoldSecs += g.unsoldSecs;
+    });
+    var overall = totalSlots ? totalSold / totalSlots : 0;
+
+    var s = [];
+    s.push('<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H +
+           '" viewBox="0 0 ' + W + ' ' + H + '">');
+
+    // ---- header: the one number, then the legend
+    var big = (overall * 100).toFixed(1) + '%';
+    s.push('<text x="' + PAD + '" y="17" font-size="19" font-weight="700" fill="' +
+           INK + '">' + big + '</text>');
+    // advance past the big number by its own rendered width (19px bold digits
+    // run ~10.6px each, the % a little wider) plus a gap -- measuring it off
+    // toFixed(1).length alone forgot the '%' and the eyebrow overlapped it
+    s.push('<text x="' + Math.round(PAD + big.length * 10.8 + 12) +
+           '" y="17" font-size="10.5" font-weight="600" fill="' + GREY +
+           '" letter-spacing="0.6">ROTATION FILL · ' + totalSold + ' OF ' +
+           totalSlots + ' SLOTS SOLD · ' +
+           Math.round(unsoldSecs) + 's UNSOLD AND UNRECOVERABLE</text>');
+
+    // legend, right-aligned on the header line
+    var lx = W - PAD, items = [];
+    TIER_ORDER.slice().reverse().forEach(function (t) {
+      var wLab = t.length * 5.6 + 20;
+      lx -= wLab;
+      items.push('<rect x="' + lx + '" y="26" width="9" height="9" rx="2" fill="' +
+                 TIER_FILL[t] + '" stroke="' + (t === "Unsold" ? EDGE : "none") +
+                 '" stroke-width="1"/>' +
+                 '<text x="' + (lx + 13) + '" y="34" font-size="9.5" fill="' + GREY +
+                 '">' + t + '</text>');
+      lx -= 8;
+    });
+    s.push(items.join(""));
+    s.push('<line x1="' + PAD + '" y1="' + (HEAD - 1) + '" x2="' + (W - PAD) +
+           '" y2="' + (HEAD - 1) + '" stroke="' + HAIR + '" stroke-width="1"/>');
+
+    // ---- one film strip per rotation
+    gs.forEach(function (g, i) {
+      var y = HEAD + i * rowH;
+      var h = rowH - 5;
+      // film stock: a dark body with a perforation band top and bottom, and
+      // the frames in the middle. This is the whole idea of the tile -- a
+      // cinema pre-show block and a DOOH loop are the same object, a fixed
+      // rotation of timed slots that plays whether or not anyone bought them.
+      var perf = Math.max(3, h * 0.19);
+      var fy = y + perf + 1;
+      var fh = Math.max(6, h - 2 * perf - 2);
+
+      // label
+      var name = g.name, maxCh = Math.floor(LBL / 5.45);
+      if (name.length > maxCh) name = name.slice(0, maxCh - 1) + "…";
+      s.push('<text x="' + PAD + '" y="' + (y + h * 0.52) +
+             '" font-size="' + (rowH > 34 ? 11.5 : 10) + '" font-weight="600" fill="' +
+             INK + '">' + esc(name) + '</text>');
+      if (rowH > 34) {
+        s.push('<text x="' + PAD + '" y="' + (y + h * 0.52 + 12) +
+               '" font-size="9" fill="' + GREY + '">' + esc(g.type) + ' · ' +
+               g.slots.length + ' × ' + g.seconds + 's</text>');
+      }
+
+      // the strip body
+      s.push('<rect x="' + stripX + '" y="' + y + '" width="' + stripW +
+             '" height="' + h + '" rx="2.5" fill="' + STOCK + '"/>');
+
+      var n = g.slots.length;
+      var fw = stripW / n;
+      // sprocket holes, one per frame, in both perforation bands
+      var holes = [];
+      for (var k = 0; k < n; k++) {
+        var hx = stripX + k * fw + fw / 2 - Math.min(3.2, fw * 0.16);
+        var hw = Math.min(6.4, fw * 0.32), hh = Math.max(1.6, perf * 0.5);
+        holes.push('<rect x="' + hx.toFixed(1) + '" y="' +
+                   (y + perf * 0.28).toFixed(1) + '" width="' + hw.toFixed(1) +
+                   '" height="' + hh.toFixed(1) + '" rx="0.8" fill="#FFFFFF" opacity="0.55"/>');
+        holes.push('<rect x="' + hx.toFixed(1) + '" y="' +
+                   (y + h - perf * 0.78).toFixed(1) + '" width="' + hw.toFixed(1) +
+                   '" height="' + hh.toFixed(1) + '" rx="0.8" fill="#FFFFFF" opacity="0.55"/>');
+      }
+      s.push(holes.join(""));
+
+      // the frames
+      g.slots.forEach(function (sl, k) {
+        // a 3px gutter, not 1.8: adjacent frames of the SAME tier were
+        // merging into one bar, which loses the whole point of drawing
+        // discrete frames -- you could no longer count the slots
+        var gap = Math.min(3, Math.max(1.2, fw * 0.11));
+        var x = stripX + k * fw + gap / 2;
+        var w = Math.max(1.5, fw - gap);
+        var unsold = sl.tier === "Unsold";
+        s.push('<rect x="' + x.toFixed(1) + '" y="' + fy.toFixed(1) +
+               '" width="' + w.toFixed(1) + '" height="' + fh.toFixed(1) +
+               '" fill="' + TIER_FILL[sl.tier] + '"' +
+               (unsold ? ' stroke="' + EDGE + '" stroke-width="1" stroke-dasharray="2 2"' : '') +
+               ' data-t="' + esc(g.name) + '|' + esc(sl.tier) + '|' +
+               esc(sl.advertiser) + '|' + sl.seconds + '|' + (sl.slot + 1) +
+               '|' + esc(g.market) + '" class="fr"/>');
+      });
+
+      // fill % and the unsold seconds, right of the strip
+      var pct = (g.fill * 100).toFixed(0) + "%";
+      var col = g.fill >= 0.9 ? "#0A7D3E" : g.fill >= 0.75 ? ORNG : RED;
+      s.push('<text x="' + (W - PAD) + '" y="' + (y + h * 0.52) +
+             '" font-size="' + (rowH > 34 ? 13 : 11) +
+             '" font-weight="700" text-anchor="end" fill="' + col + '">' + pct +
+             '</text>');
+      if (rowH > 34) {
+        s.push('<text x="' + (W - PAD) + '" y="' + (y + h * 0.52 + 12) +
+               '" font-size="9" text-anchor="end" fill="' + GREY + '">' +
+               g.unsoldSecs + 's free</text>');
+      }
+    });
+
+    if (state !== "bound") {
+      s.push('<text x="' + PAD + '" y="' + (H - 3) + '" font-size="9" fill="' +
+             GREY + '">' + esc(state) + (diag ? " · " + esc(diag) : "") +
+             ' · showing the shape</text>');
+    }
+    s.push('</svg>');
+    stage.innerHTML = s.join("");
+
+    // tooltip: delegated, so it survives every re-render
+    var frames = stage.querySelectorAll(".fr");
+    for (var q = 0; q < frames.length; q++) {
+      frames[q].addEventListener("mousemove", onMove);
+      frames[q].addEventListener("mouseleave", onLeave);
+    }
+  }
+
+  function onMove(e) {
+    var p = (e.currentTarget.getAttribute("data-t") || "").split("|");
+    tip.innerHTML = "<b>" + p[0] + "</b><br>Slot " + p[4] + " · " + p[3] +
+                    "s · " + p[5] + "<br>" +
+                    (p[1] === "Unsold"
+                      ? "<b>UNSOLD</b> — perishable, cannot be sold later"
+                      : p[1] + " · " + p[2]);
+    tip.style.opacity = 1;
+    var W = stage.clientWidth;
+    var x = e.clientX + 12, tw = tip.offsetWidth;
+    if (x + tw > W - 4) x = e.clientX - tw - 12;
+    tip.style.left = x + "px";
+    tip.style.top = (e.clientY + 14) + "px";
+  }
+  function onLeave() { tip.style.opacity = 0; }
+
+  // ResizeObserver on the STAGE, not a window resize listener -- the tile is
+  // resized by its Sigma container, which never fires a window resize.
+  if (window.ResizeObserver) new ResizeObserver(render).observe(stage);
+  render();
+
+  var SDK = window.SigmaPlugin || window.sigmaComputing;
+  if (!SDK || !SDK.plugin) { state = "SDK not loaded"; render(); return; }
+  var client = SDK.plugin.client;
+
+  client.config.configureEditorPanel([
+    { name: "source", type: "element" },
+    { name: "rotation", type: "column", source: "source", allowedTypes: ["text"], label: "Rotation" },
+    { name: "type", type: "column", source: "source", allowedTypes: ["text"], label: "Rotation Type" },
+    { name: "market", type: "column", source: "source", allowedTypes: ["text"], label: "Market" },
+    { name: "slot", type: "column", source: "source", allowedTypes: ["number"], label: "Slot" },
+    { name: "seconds", type: "column", source: "source", allowedTypes: ["number"], label: "Seconds" },
+    { name: "tier", type: "column", source: "source", allowedTypes: ["text"], label: "Tier" },
+    { name: "advertiser", type: "column", source: "source", allowedTypes: ["text"], label: "Advertiser" }
+  ]);
+
+  var unsub = null;
+  client.config.subscribe(function (cfg) {
+    if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
+    if (!cfg || !cfg.source) {
+      state = "no config"; diag = ""; rows = synth(); render(); return;
+    }
+    state = "awaiting data"; diag = ""; render();
+    unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
+      var next = toRows(data, cfg);
+      if (next && next.length) {
+        state = "bound"; diag = ""; rows = next;
+      } else {
+        // name what actually arrived: if the keys are not the configured
+        // column ids, the tile looks identical to a slow load
+        state = "no rows";
+        diag = data ? Object.keys(data).slice(0, 4).join(",") : "no data";
+        rows = synth();
+      }
+      render();
+    });
+  });
+})();
+</script>
+</body>
+</html>
