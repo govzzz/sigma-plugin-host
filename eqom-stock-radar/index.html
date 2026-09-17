@@ -83,7 +83,7 @@
       { sku:"Beate Uhse Bondage Kit Classic", brand:"Beate Uhse", channel:"eBay", cover:16.8, units:34, value:92 },
       { sku:"Christine le Duc Lace Body M", brand:"Christine le Duc", channel:"Own webshop", cover:11.2, units:148, value:64 },
       { sku:"Pjur Original 250ml", brand:"Christine le Duc", channel:"Bol", cover:4.8, units:380, value:22 },
-      { sku:"Shots Toys Realrock 8in", brand:"Eropartner Distribution", channel:"Octopia", cover:9.6, units:268, value:156 },
+      { sku:"Shots Toys Realrock 8in", brand:"Eropartner Distribution", channel:"Octopia", cover:12.8, units:268, value:156 },
       { sku:"Eropartner Bulk Lube 5L", brand:"Eropartner Distribution", channel:"Own webshop", cover:14.2, units:96, value:118 },
       { sku:"Satisfyer Curvy Trinity 4", brand:"EasyToys", channel:"Amazon", cover:3.6, units:740, value:68 },
       { sku:"Magic Wand Original HV-260", brand:"EasyToys", channel:"Otto", cover:10.4, units:112, value:174 }
@@ -194,9 +194,13 @@
       if (rows[i].quadrant === "Stockout risk" && (!worst || rows[i].value > worst.value)) worst = rows[i];
     }
     if (worst) {
-      var lx = x(worst.cover) + r(worst.value) + 6, anchor = "start";
-      if (lx > M.l + iw - 120) { lx = x(worst.cover) - r(worst.value) - 6; anchor = "end"; }
-      s.push('<text x="' + lx + '" y="' + (y(worst.units) + 3) + '" font-size="10" font-weight="700" fill="' + INK +
+      // ABOVE the dot, not beside it: at the same velocity as a neighbouring
+      // bubble a side label lands on top of it, which is what the first render
+      // showed. Clamp into the plot so a top-of-range line stays readable.
+      var ly2 = Math.max(M.t + 10, y(worst.units) - r(worst.value) - 7);
+      var lx = Math.min(Math.max(M.l + 4, x(worst.cover)), M.l + iw - 4);
+      var anchor = lx > M.l + iw - 120 ? "end" : "middle";
+      s.push('<text x="' + lx + '" y="' + ly2 + '" font-size="10" font-weight="700" fill="' + INK +
              '" text-anchor="' + anchor + '">' + esc(worst.sku) + '</text>');
     }
 
