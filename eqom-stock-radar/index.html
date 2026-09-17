@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EQOM — Stock Radar</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#FFFFFF;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+               color:#0B2B36; -webkit-font-smoothing:antialiased; }
+  #stage { position:absolute; inset:0; overflow:hidden; }
+  svg { display:block; }
+  #tip { position:absolute; pointer-events:none; opacity:0; transition:opacity .08s;
+         background:#0B2B36; color:#fff; font-size:11px; line-height:1.4;
+         padding:7px 9px; border-radius:6px; white-space:nowrap; z-index:5;
+         box-shadow:0 4px 14px rgba(0,0,0,.26); }
+  #tip b { font-weight:700; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="tip"></div>
+
+<!-- React must load BEFORE the Sigma plugin SDK. The unversioned UMD bundle at
+     unpkg calls React.createContext() at module-evaluation time, so without a
+     global React it throws part-way through the factory, leaves
+     window.SigmaPlugin as an empty object, and the tile renders blank with no
+     visible error -- even for a plugin like this one that never touches React. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  "use strict";
+
+  // EQOM's own palette, sampled from eqom.com's stylesheet rather than guessed.
+  // The site is a Wix build, so the Wix admin defaults (#116dff, #3899ec) are
+  // in the bundle and are NOT brand colours: the EQOM colours are the pink
+  // accent that carries every heading and CTA (#F06B86), near-black ink and a
+  // deep teal (#004966).
+  var INK    = "#0B2B36";   // deep teal ink -- their own, dark enough for text
+  var PINK   = "#D6456A";   // brand pink, darkened to carry white text
+  var TEAL   = "#45B0C9";
+  var GREEN  = "#1F8A6D";   // the POSITIVE colour; their palette has no green
+  var GREY   = "#8F8F8F";   // their own mid grey
+  var HAIR   = "#E3E9EC";
+  var WASH   = "#F7FAFB";
+  var MUTED  = "#5B6B72";
+
+  // The quadrant thresholds live in the SQL (channel_radar_sql derives
+  // `Quadrant`), so the plugin colours what it is told rather than re-deciding
+  // it -- one place to change a threshold, and the tooltip, the legend and the
+  // dot can never disagree.
+  var QUAD_FILL = {
+    "Stockout risk": PINK,
+    "Healthy":       GREEN,
+    "Overstocked":   TEAL,
+    "Dead stock":    GREY
+  };
+  var QUAD_ORDER = ["Stockout risk", "Healthy", "Overstocked", "Dead stock"];
+  var RISK_WEEKS = 4.0, OVER_WEEKS = 12.0;
+
+  var stage = document.getElementById("stage");
+  var tip = document.getElementById("tip");
+  var rows = [];
+  var state = "no config";
+  var diag = "";
+
+  // The unbound fallback. A good synth() is indistinguishable from real data,
+  // which is exactly what makes a mis-bound column invisible -- so the bind
+  // marker below always says which of the two you are looking at.
+  function synth() {
+    return [
+      { sku:"Satisfyer Pro 2 Next Gen", brand:"EasyToys", channel:"Amazon", cover:1.8, units:1420, value:96 },
+      { sku:"We-Vibe Chorus Couples", brand:"EasyToys", channel:"Bol", cover:2.4, units:610, value:128 },
+      { sku:"EasyToys Anal Trainer Set 3pc", brand:"EasyToys", channel:"Own webshop", cover:3.1, units:1840, value:74 },
+      { sku:"Womanizer Duo 2", brand:"Amorelie", channel:"Amazon", cover:2.9, units:385, value:142 },
+      { sku:"Amorelie Adventskalender 2026", brand:"Amorelie", channel:"Own webshop", cover:6.4, units:240, value:218 },
+      { sku:"Lelo Sona 2 Cruise", brand:"Amorelie", channel:"Douglas", cover:8.2, units:128, value:96 },
+      { sku:"Durex Mutual Climax 40pc", brand:"Kondomeriet", channel:"Shop Apotheke", cover:5.6, units:920, value:42 },
+      { sku:"Kondomeriet Glide Original 1L", brand:"Kondomeriet", channel:"Own webshop", cover:7.8, units:455, value:28 },
+      { sku:"Fun Factory Stronic Real", brand:"Beate Uhse", channel:"Otto", cover:13.4, units:62, value:184 },
+      { sku:"Beate Uhse Bondage Kit Classic", brand:"Beate Uhse", channel:"eBay", cover:16.8, units:34, value:92 },
+      { sku:"Christine le Duc Lace Body M", brand:"Christine le Duc", channel:"Own webshop", cover:11.2, units:148, value:64 },
+      { sku:"Pjur Original 250ml", brand:"Christine le Duc", channel:"Bol", cover:4.8, units:380, value:22 },
+      { sku:"Shots Toys Realrock 8in", brand:"Eropartner Distribution", channel:"Octopia", cover:9.6, units:268, value:156 },
+      { sku:"Eropartner Bulk Lube 5L", brand:"Eropartner Distribution", channel:"Own webshop", cover:14.2, units:96, value:118 },
+      { sku:"Satisfyer Curvy Trinity 4", brand:"EasyToys", channel:"Amazon", cover:3.6, units:740, value:68 },
+      { sku:"Magic Wand Original HV-260", brand:"EasyToys", channel:"Otto", cover:10.4, units:112, value:174 }
+    ].map(withQuadrant);
+  }
+
+  function withQuadrant(r) {
+    r.quadrant = r.quadrant || (r.cover < RISK_WEEKS ? "Stockout risk"
+                 : r.cover > OVER_WEEKS ? (r.units < 100 ? "Dead stock" : "Overstocked")
+                 : "Healthy");
+    return r;
+  }
+
+  function toRows(data, cfg) {
+    if (!data) return [];
+    var col = function (key) { return cfg[key] ? data[cfg[key]] : null; };
+    var sku = col("sku"), brand = col("brand"), chan = col("channel"),
+        cover = col("cover"), units = col("units"), value = col("value"),
+        quad = col("quadrant");
+    if (!sku || !cover || !units) return [];
+    var out = [];
+    for (var i = 0; i < sku.length; i++) {
+      out.push(withQuadrant({
+        sku: String(sku[i]),
+        brand: brand ? String(brand[i]) : "",
+        channel: chan ? String(chan[i]) : "",
+        cover: Number(cover[i]),
+        units: Number(units[i]),
+        value: value ? Number(value[i]) : 0,
+        quadrant: quad ? String(quad[i]) : null
+      }));
+    }
+    return out;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function render() {
+    var W = stage.clientWidth || 900, H = stage.clientHeight || 340;
+    var M = { t: 44, r: 16, b: 40, l: 54 };
+    var iw = Math.max(80, W - M.l - M.r), ih = Math.max(60, H - M.t - M.b);
+
+    var maxCover = 18, maxUnits = 0, i;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].cover > maxCover) maxCover = Math.ceil(rows[i].cover) + 1;
+      if (rows[i].units > maxUnits) maxUnits = rows[i].units;
+    }
+    maxUnits = Math.max(200, maxUnits * 1.08);
+    var maxVal = 1;
+    for (i = 0; i < rows.length; i++) maxVal = Math.max(maxVal, rows[i].value);
+
+    var x = function (c) { return M.l + (Math.min(c, maxCover) / maxCover) * iw; };
+    // sqrt on the velocity axis: a 1,840-a-week hero and a 34-a-week tail line
+    // are both decisions, and on a linear axis the whole tail collapses onto
+    // the floor where the risk quadrant is unreadable.
+    var y = function (u) { return M.t + ih - Math.sqrt(Math.max(0, u) / maxUnits) * ih; };
+    var r = function (v) { return 4 + 11 * Math.sqrt(Math.max(0, v) / maxVal); };
+
+    var s = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">'];
+    s.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#FFFFFF"/>');
+
+    // the at-risk band, drawn as a field rather than a line: the point of the
+    // tile is the REGION a planner must clear, not a threshold value
+    s.push('<rect x="' + M.l + '" y="' + M.t + '" width="' + (x(RISK_WEEKS) - M.l) +
+           '" height="' + ih + '" fill="' + PINK + '" opacity="0.07"/>');
+    s.push('<rect x="' + x(OVER_WEEKS) + '" y="' + M.t + '" width="' + (M.l + iw - x(OVER_WEEKS)) +
+           '" height="' + ih + '" fill="' + TEAL + '" opacity="0.07"/>');
+
+    // gridlines every 4 weeks
+    for (var c = 0; c <= maxCover; c += 4) {
+      s.push('<line x1="' + x(c) + '" y1="' + M.t + '" x2="' + x(c) + '" y2="' + (M.t + ih) +
+             '" stroke="' + HAIR + '" stroke-width="1"/>');
+      s.push('<text x="' + x(c) + '" y="' + (M.t + ih + 16) + '" font-size="10" fill="' + MUTED +
+             '" text-anchor="middle">' + c + 'w</text>');
+    }
+    s.push('<line x1="' + M.l + '" y1="' + (M.t + ih) + '" x2="' + (M.l + iw) + '" y2="' + (M.t + ih) +
+           '" stroke="' + HAIR + '" stroke-width="1"/>');
+
+    // velocity ticks, on the sqrt scale
+    var ticks = [0, Math.round(maxUnits * 0.06), Math.round(maxUnits * 0.25), Math.round(maxUnits * 0.56), Math.round(maxUnits)];
+    for (i = 0; i < ticks.length; i++) {
+      s.push('<text x="' + (M.l - 8) + '" y="' + (y(ticks[i]) + 3) + '" font-size="10" fill="' + MUTED +
+             '" text-anchor="end">' + ticks[i].toLocaleString() + '</text>');
+    }
+
+    // quadrant captions
+    s.push('<text x="' + (M.l + 6) + '" y="' + (M.t - 8) + '" font-size="10" font-weight="700" fill="' + PINK +
+           '">STOCKOUT RISK — under ' + RISK_WEEKS + ' weeks cover</text>');
+    s.push('<text x="' + (M.l + iw) + '" y="' + (M.t - 8) + '" font-size="10" font-weight="700" fill="' + TEAL +
+           '" text-anchor="end">OVERSTOCKED — over ' + OVER_WEEKS + ' weeks, cash tied up</text>');
+    s.push('<text x="' + (M.l - 46) + '" y="' + (M.t + ih / 2) + '" font-size="10" fill="' + MUTED +
+           '" transform="rotate(-90 ' + (M.l - 46) + ' ' + (M.t + ih / 2) + ')" text-anchor="middle">units / week</text>');
+
+    // bubbles, biggest first so a small hot line is never hidden under a big
+    // cold one
+    var ordered = rows.slice().sort(function (a, b) { return b.value - a.value; });
+    for (i = 0; i < ordered.length; i++) {
+      var d = ordered[i], fill = QUAD_FILL[d.quadrant] || GREY;
+      s.push('<circle class="dot" data-i="' + i + '" cx="' + x(d.cover).toFixed(1) + '" cy="' + y(d.units).toFixed(1) +
+             '" r="' + r(d.value).toFixed(1) + '" fill="' + fill + '" fill-opacity="0.72" stroke="' + fill +
+             '" stroke-width="1.5"/>');
+    }
+    // label the single worst line: most value at risk inside the risk band
+    var worst = null;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].quadrant === "Stockout risk" && (!worst || rows[i].value > worst.value)) worst = rows[i];
+    }
+    if (worst) {
+      var lx = x(worst.cover) + r(worst.value) + 6, anchor = "start";
+      if (lx > M.l + iw - 120) { lx = x(worst.cover) - r(worst.value) - 6; anchor = "end"; }
+      s.push('<text x="' + lx + '" y="' + (y(worst.units) + 3) + '" font-size="10" font-weight="700" fill="' + INK +
+             '" text-anchor="' + anchor + '">' + esc(worst.sku) + '</text>');
+    }
+
+    // header: the count and the money, which is the sentence a planner repeats
+    var nRisk = 0, valRisk = 0, nOver = 0, valOver = 0;
+    for (i = 0; i < rows.length; i++) {
+      if (rows[i].quadrant === "Stockout risk") { nRisk++; valRisk += rows[i].value; }
+      if (rows[i].quadrant === "Overstocked" || rows[i].quadrant === "Dead stock") { nOver++; valOver += rows[i].value; }
+    }
+    s.push('<text x="' + M.l + '" y="18" font-size="12" font-weight="700" fill="' + INK + '">' +
+           nRisk + ' lines under ' + RISK_WEEKS + 'w cover · €' + Math.round(valRisk).toLocaleString() +
+           'k of demand at risk</text>');
+    s.push('<text x="' + (M.l + iw) + '" y="18" font-size="11" fill="' + MUTED + '" text-anchor="end">' +
+           nOver + ' lines over ' + OVER_WEEKS + 'w · €' + Math.round(valOver).toLocaleString() + 'k tied up</text>');
+
+    // legend
+    var lx2 = M.l, ly = H - 10;
+    for (i = 0; i < QUAD_ORDER.length; i++) {
+      var q = QUAD_ORDER[i];
+      s.push('<circle cx="' + (lx2 + 4) + '" cy="' + (ly - 4) + '" r="4" fill="' + QUAD_FILL[q] + '" fill-opacity="0.72" stroke="' + QUAD_FILL[q] + '"/>');
+      s.push('<text x="' + (lx2 + 13) + '" y="' + ly + '" font-size="10" fill="' + MUTED + '">' + q + '</text>');
+      lx2 += 22 + q.length * 5.6;
+    }
+
+    // The bind marker. A synth() fallback this close to the real data is
+    // otherwise indistinguishable from a mis-bound column, and plugin data
+    // binding is NOT observable through the server-side PNG export at all --
+    // so this three-state marker is the only way anyone can tell.
+    var mark = state === "bound" ? "" :
+        (state === "no config" ? "unbound — sample data" :
+         state === "awaiting data" ? "awaiting data…" :
+         state === "no rows" ? "no rows (" + diag + ")" : state);
+    if (mark) {
+      s.push('<rect x="' + (W - 8 - (mark.length * 5.4 + 14)) + '" y="' + (H - 20) + '" width="' + (mark.length * 5.4 + 14) +
+             '" height="15" rx="7" fill="' + WASH + '" stroke="' + HAIR + '"/>');
+      s.push('<text x="' + (W - 15) + '" y="' + (H - 9) + '" font-size="9" fill="' + MUTED +
+             '" text-anchor="end">' + esc(mark) + '</text>');
+    }
+
+    s.push('</svg>');
+    stage.innerHTML = s.join("");
+
+    var dots = stage.querySelectorAll(".dot");
+    for (i = 0; i < dots.length; i++) {
+      dots[i].addEventListener("mousemove", onMove);
+      dots[i].addEventListener("mouseleave", onLeave);
+    }
+    stage.__ordered = ordered;
+  }
+
+  function onMove(ev) {
+    var d = (stage.__ordered || [])[Number(ev.target.getAttribute("data-i"))];
+    if (!d) return;
+    tip.innerHTML = "<b>" + esc(d.sku) + "</b><br>" + esc(d.brand) +
+      (d.channel ? " · " + esc(d.channel) : "") + "<br>" +
+      d.cover.toFixed(1) + " weeks cover · " + Math.round(d.units).toLocaleString() + " units/wk<br>€" +
+      Math.round(d.value).toLocaleString() + "k stock value · " + esc(d.quadrant);
+    tip.style.opacity = 1;
+    var W = stage.clientWidth;
+    var left = ev.clientX + 12, tw = tip.offsetWidth;
+    if (left + tw > W - 6) left = ev.clientX - tw - 12;
+    tip.style.left = left + "px";
+    tip.style.top = (ev.clientY + 12) + "px";
+  }
+  function onLeave() { tip.style.opacity = 0; }
+
+  // ResizeObserver on the STAGE, not a window resize listener -- the tile is
+  // resized by its Sigma container, which never fires a window resize.
+  if (window.ResizeObserver) new ResizeObserver(render).observe(stage);
+  rows = synth();
+  render();
+
+  // The UMD bundle exposes itself FLAT on window.SigmaPlugin: its exports are
+  // `client`, `SigmaClientProvider`, `polyfillRequestAnimationFrame` and the
+  // React hooks. There is NO `plugin` property, so the documented
+  // `window.sigmaComputing.plugin.client` shape is undefined, the reference
+  // throws on the first line, and the tile paints the unbound fallback for
+  // ever while looking almost right.
+  var SP = window.SigmaPlugin || window.sigmaComputing;
+  var client = SP && (SP.client || (SP.plugin && SP.plugin.client));
+  if (!client) { state = "SDK not loaded"; render(); return; }
+
+  client.config.configureEditorPanel([
+    { name: "source", type: "element" },
+    { name: "sku", type: "column", source: "source", allowedTypes: ["text"], label: "SKU" },
+    { name: "brand", type: "column", source: "source", allowedTypes: ["text"], label: "Brand" },
+    { name: "channel", type: "column", source: "source", allowedTypes: ["text"], label: "Channel" },
+    { name: "cover", type: "column", source: "source", allowedTypes: ["number"], label: "Cover Weeks" },
+    { name: "units", type: "column", source: "source", allowedTypes: ["number"], label: "Weekly Units" },
+    { name: "value", type: "column", source: "source", allowedTypes: ["number"], label: "Value At Risk" },
+    { name: "quadrant", type: "column", source: "source", allowedTypes: ["text"], label: "Quadrant" }
+  ]);
+
+  var unsub = null;
+  client.config.subscribe(function (cfg) {
+    if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
+    if (!cfg || !cfg.source) {
+      state = "no config"; diag = ""; rows = synth(); render(); return;
+    }
+    state = "awaiting data"; diag = ""; render();
+    unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
+      var next = toRows(data, cfg);
+      if (next && next.length) {
+        state = "bound"; diag = ""; rows = next;
+      } else {
+        // name what actually arrived: if the keys are not the configured
+        // column ids, the tile looks identical to a slow load
+        state = "no rows";
+        diag = data ? Object.keys(data).slice(0, 4).join(",") : "no data";
+        rows = synth();
+      }
+      render();
+    });
+  });
+})();
+</script>
+</body>
+</html>
