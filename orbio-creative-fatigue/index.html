@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbio World — Creative Fatigue</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; background:#FFFFFF;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+               color:#12262B; -webkit-font-smoothing:antialiased; }
+  #stage { position:absolute; inset:0; overflow:hidden; }
+  svg { display:block; }
+  #tip { position:absolute; pointer-events:none; opacity:0; transition:opacity .08s;
+         background:#12262B; color:#fff; font-size:11px; line-height:1.45;
+         padding:7px 9px; border-radius:6px; white-space:nowrap; z-index:5;
+         box-shadow:0 4px 14px rgba(0,0,0,.26); }
+  #tip b { font-weight:700; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="tip"></div>
+
+<!-- React must load BEFORE the Sigma plugin SDK. The unversioned UMD bundle at
+     unpkg calls React.createContext() at module-evaluation time, so without a
+     global React it throws part-way through the factory, leaves
+     window.SigmaPlugin as an empty object, and the tile renders blank with no
+     visible error -- even for a plugin like this one that never touches React. -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@sigmacomputing/plugin"></script>
+<script>
+(function () {
+  "use strict";
+
+  // Orbio World's palette, sampled from orbio.world's served stylesheet rather
+  // than guessed: the whole brand is near-black ink #141317 and one electric
+  // cyan #37CFD5 on an off-white #EFEBED, with #515054 for muted type. The raw
+  // cyan is too pale to read as a line on white, so the chart uses deepened
+  // forms of their own colour rather than borrowed hues.
+  var INK   = "#12262B";
+  var CYAN  = "#2ABAC2";
+  var TEAL  = "#0B757C";
+  var GREY  = "#9AA7AD";
+  var HAIR  = "#E2E9EA";
+  var WASH  = "#F5FAFA";
+  var MUTED = "#5A6B70";
+  // Status colours are semantics, not brand: a buyer reads these as a traffic
+  // light and Orbio's two-colour palette has no green and no red to lend.
+  var STATUS = { "Scale": "#17876B", "Hold": "#2ABAC2",
+                 "Refresh": "#C08A2E", "Cut": "#C0453F" };
+  var STATUS_ORDER = ["Scale", "Hold", "Refresh", "Cut"];
+
+  var stage = document.getElementById("stage");
+  var tip = document.getElementById("tip");
+  var creatives = [];        // [{creative, brand, channel, be, status, pts:[{day,roas,spend}]}]
+  var state = "no config";
+  var diag = "";
+
+  // The unbound fallback. Identical arithmetic to creative_decay_sql: launch
+  // ROAS decaying geometrically, a floor at 0.38, and a break-even that is
+  // 1 / gross margin for the BRAND -- which is why the same ROAS is a winner
+  // on Nuubu and a loss on Muama. A good synth() is indistinguishable from
+  // real data, which is exactly what makes a mis-bound column invisible, so
+  // the bind marker below always says which of the two you are looking at.
+  var SYNTH_DEFS = [
+    ["NUU-UGC-DetoxNight-v4",  "Nuubu",    "Meta",    3.42, 0.091, 18400, 1.28],
+    ["NUU-Static-BeforeAfter", "Nuubu",    "Google",  2.62, 0.020,  9600, 1.28],
+    ["DER-UGC-SleepTest-v2",   "Derila",   "Meta",    2.86, 0.060, 21800, 1.40],
+    ["DER-Creator-30s-NEW",    "Derila",   "TikTok",  3.64, 0.118, 14200, 1.40],
+    ["MUA-Travel-Demo-v7",     "Muama",    "YouTube", 2.44, 0.034, 11500, 1.71],
+    ["MUA-Translator-Split",   "Muama",    "Meta",    1.92, 0.052,  8700, 1.71],
+    ["HUU-Chef-Unbox-v9",      "Huusk",    "Meta",    1.74, 0.046, 10300, 1.47],
+    ["SYN-Grime-15s-v3",       "Synoshi",  "TikTok",  4.12, 0.045, 16900, 1.42],
+    ["SYN-SplitScreen-v5",     "Synoshi",  "Meta",    2.62, 0.042,  7400, 1.42],
+    ["LIN-Polyglot-Hook-v6",   "Lingoget", "TikTok",  2.98, 0.074, 12600, 1.09]
+  ];  var DAYS = 14;
+
+  function curve(launch, decay, day) {
+    return Math.max(0.38, launch * Math.pow(1 - decay, day));
+  }
+
+  function statusOf(final, be) {
+    return final >= be * 1.45 ? "Scale"
+         : final >= be        ? "Hold"
+         : final >= be * 0.85 ? "Refresh" : "Cut";
+  }
+
+  function synth() {
+    var out = [];
+    for (var i = 0; i < SYNTH_DEFS.length; i++) {
+      var d = SYNTH_DEFS[i], pts = [];
+      for (var k = 0; k < DAYS; k++) {
+        pts.push({ day: k, roas: Math.round(curve(d[3], d[4], k) * 1000) / 1000,
+                   spend: Math.round(d[5] * (1 + 0.055 * k)) });
+      }
+      out.push({ creative: d[0], brand: d[1], channel: d[2], be: d[6],
+                 status: statusOf(pts[DAYS - 1].roas, d[6]), pts: pts });
+    }
+    return out;
+  }
+
+  // One row per creative per DAY arrives flat; fold it back into curves.
+  // Order is preserved from the query, and days are sorted per creative so a
+  // warehouse that returns them unordered still draws a monotonic x-axis.
+  function toCreatives(data, cfg) {
+    if (!data) return [];
+    var col = function (key) { return cfg[key] ? data[cfg[key]] : null; };
+    var name = col("creative"), brand = col("brand"), chan = col("channel"),
+        day = col("day"), roas = col("roas"), spend = col("spend"),
+        be = col("breakeven"), status = col("status");
+    if (!name || !day || !roas) return [];
+    var byName = {}, order = [], i;
+    for (i = 0; i < name.length; i++) {
+      var k = String(name[i]);
+      if (!byName[k]) {
+        byName[k] = { creative: k,
+                      brand: brand ? String(brand[i]) : "",
+                      channel: chan ? String(chan[i]) : "",
+                      be: be ? Number(be[i]) : 1,
+                      status: status ? String(status[i]) : null,
+                      pts: [] };
+        order.push(k);
+      }
+      byName[k].pts.push({ day: Number(day[i]), roas: Number(roas[i]),
+                           spend: spend ? Number(spend[i]) : 0 });
+    }
+    var out = [];
+    for (i = 0; i < order.length; i++) {
+      var c = byName[order[i]];
+      c.pts.sort(function (a, b) { return a.day - b.day; });
+      if (!c.status) c.status = statusOf(c.pts[c.pts.length - 1].roas, c.be);
+      out.push(c);
+    }
+    return out;
+  }
+
+  function crossDay(c) {
+    for (var i = 0; i < c.pts.length; i++) if (c.pts[i].roas < c.be) return c.pts[i].day;
+    return null;
+  }
+
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function clip(s, n) {
+    s = String(s);
+    return s.length <= n ? s : s.slice(0, n - 1) + "…";
+  }
+
+  function eur(v) {
+    return "€" + Math.round(v).toLocaleString();
+  }
+
+  function render() {
+    var W = stage.clientWidth || 940, H = stage.clientHeight || 340;
+    var HEAD = 34, FOOT = 18;
+    var n = creatives.length || 1;
+    // Small multiples, not one crowded chart: ten curves on shared axes is an
+    // unreadable spaghetti plot, and the question here is per-creative ("is
+    // THIS one still earning?"), not comparative.
+    var cols = Math.max(2, Math.min(5, Math.floor((W - 12) / 168)));
+    var rowsN = Math.ceil(n / cols);
+    var pw = Math.floor((W - 12 - (cols - 1) * 8) / cols);
+    var ph = Math.floor((H - HEAD - FOOT - (rowsN - 1) * 8) / rowsN);
+    if (ph < 52) { rowsN = Math.ceil(n / cols); ph = Math.max(52, ph); }
+
+    var s = ['<svg xmlns="http://www.w3.org/2000/svg" width="' + W + '" height="' + H + '">'];
+    s.push('<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#FFFFFF"/>');
+
+    // Header: the sentence a media buyer repeats in stand-up -- how many are
+    // past break-even and what that is costing per day, not a chart title.
+    var nBad = 0, spendBad = 0, i;
+    for (i = 0; i < creatives.length; i++) {
+      var c = creatives[i], last = c.pts[c.pts.length - 1];
+      if (last.roas < c.be) { nBad++; spendBad += last.spend; }
+    }
+    s.push('<text x="6" y="15" font-size="12.5" font-weight="700" fill="' + INK + '">' +
+           nBad + ' of ' + creatives.length + ' creatives past break-even · ' +
+           eur(spendBad) + '/day buying below margin</text>');
+    s.push('<text x="6" y="28" font-size="10" fill="' + MUTED + '">' +
+           'ROAS by day since launch · dashed line is that brand’s own break-even (1 ÷ gross margin)</text>');
+
+    // legend, top right
+    var lx = W - 6;
+    for (i = STATUS_ORDER.length - 1; i >= 0; i--) {
+      var q = STATUS_ORDER[i], tw = q.length * 5.6;
+      lx -= tw + 8;
+      s.push('<text x="' + (lx + tw) + '" y="15" font-size="10" font-weight="600" fill="' +
+             STATUS[q] + '" text-anchor="end">' + q + '</text>');
+      s.push('<circle cx="' + (lx - 6) + '" cy="11.5" r="3.5" fill="' + STATUS[q] + '"/>');
+      lx -= 12;
+    }
+
+    for (i = 0; i < creatives.length; i++) {
+      var c2 = creatives[i];
+      var cx = 6 + (i % cols) * (pw + 8);
+      var cy = HEAD + Math.floor(i / cols) * (ph + 8);
+      s.push(panel(c2, i, cx, cy, pw, ph));
+    }
+
+    // The bind marker. A synth() fallback this close to the real data is
+    // otherwise indistinguishable from a mis-bound column, and plugin data
+    // binding is NOT observable through Sigma's server-side PNG export at all
+    // -- so this three-state marker is the only way anyone can tell.
+    var mark = state === "bound" ? "" :
+        (state === "no config" ? "unbound — sample data" :
+         state === "awaiting data" ? "awaiting data…" :
+         state === "no rows" ? "no rows (" + diag + ")" : state);
+    if (mark) {
+      var mw = mark.length * 5.4 + 14;
+      s.push('<rect x="' + (W - 6 - mw) + '" y="' + (H - 16) + '" width="' + mw +
+             '" height="14" rx="7" fill="' + WASH + '" stroke="' + HAIR + '"/>');
+      s.push('<text x="' + (W - 13) + '" y="' + (H - 6) + '" font-size="9" fill="' + MUTED +
+             '" text-anchor="end">' + esc(mark) + '</text>');
+    }
+
+    s.push('</svg>');
+    stage.innerHTML = s.join("");
+
+    var hit = stage.querySelectorAll(".hit");
+    for (i = 0; i < hit.length; i++) {
+      hit[i].addEventListener("mousemove", onMove);
+      hit[i].addEventListener("mouseleave", onLeave);
+    }
+  }
+
+  function panel(c, idx, X, Y, PW, PH) {
+    var TOP = 26, BOT = 11, PAD = 7;
+    var iw = PW - PAD * 2, ih = PH - TOP - BOT;
+    var col = STATUS[c.status] || GREY;
+    var pts = c.pts, last = pts[pts.length - 1];
+    var maxDay = pts[pts.length - 1].day || 1;
+    var hiR = c.be * 1.15, j;
+    for (j = 0; j < pts.length; j++) hiR = Math.max(hiR, pts[j].roas);
+    hiR *= 1.08;
+
+    var x = function (d) { return X + PAD + (d / maxDay) * iw; };
+    var y = function (r) { return Y + TOP + ih - (Math.max(0, r) / hiR) * ih; };
+
+    var o = ['<g>'];
+    o.push('<rect x="' + X + '" y="' + Y + '" width="' + PW + '" height="' + PH +
+           '" rx="6" fill="' + WASH + '" stroke="' + HAIR + '"/>');
+
+    // Below break-even is drawn as a FIELD, not a line: the point of the tile
+    // is the region where an order stops paying for its own media.
+    var beY = y(c.be);
+    o.push('<rect x="' + (X + PAD) + '" y="' + beY + '" width="' + iw + '" height="' +
+           Math.max(0, (Y + TOP + ih) - beY) + '" fill="' + STATUS.Cut + '" opacity="0.07"/>');
+    o.push('<line x1="' + (X + PAD) + '" y1="' + beY + '" x2="' + (X + PAD + iw) + '" y2="' + beY +
+           '" stroke="' + MUTED + '" stroke-width="1" stroke-dasharray="3 3"/>');
+    // The caption goes on whichever side the curve is furthest from the
+    // line. These curves decay monotonically, so a high break-even (Muama at
+    // 1.71) is crowded on the LEFT and a low one (Nuubu at 1.28) on the
+    // right; a fixed side lands the label on the curve for half the brands.
+    var gapL = Math.abs(y(pts[0].roas) - beY);
+    var gapR = Math.abs(y(last.roas) - beY);
+    o.push(gapL >= gapR
+      ? '<text x="' + (X + PAD + 2) + '" y="' + (beY - 3) + '" font-size="8" fill="' + MUTED +
+        '">break-even ' + c.be.toFixed(2) + '</text>'
+      : '<text x="' + (X + PAD + iw) + '" y="' + (beY - 3) + '" font-size="8" fill="' + MUTED +
+        '" text-anchor="end">break-even ' + c.be.toFixed(2) + '</text>');
+
+    // the curve
+    var d = "";
+    for (j = 0; j < pts.length; j++) {
+      d += (j ? "L" : "M") + x(pts[j].day).toFixed(1) + " " + y(pts[j].roas).toFixed(1) + " ";
+    }
+    o.push('<path d="' + d + '" fill="none" stroke="' + col + '" stroke-width="2" ' +
+           'stroke-linejoin="round" stroke-linecap="round"/>');
+
+    // the crossing: the single most actionable mark on the tile
+    var cd = crossDay(c);
+    if (cd !== null) {
+      o.push('<line x1="' + x(cd) + '" y1="' + (Y + TOP) + '" x2="' + x(cd) + '" y2="' + (Y + TOP + ih) +
+             '" stroke="' + col + '" stroke-width="1" stroke-dasharray="2 3" opacity="0.7"/>');
+      o.push('<circle cx="' + x(cd) + '" cy="' + y(c.pts[cd] ? c.pts[cd].roas : c.be) +
+             '" r="3" fill="#FFFFFF" stroke="' + col + '" stroke-width="2"/>');
+      o.push('<text x="' + (x(cd) + 3) + '" y="' + (Y + TOP + ih - 2) + '" font-size="8" fill="' + col +
+             '" font-weight="700">d' + cd + '</text>');
+    }
+    // the end point
+    o.push('<circle cx="' + x(last.day) + '" cy="' + y(last.roas) + '" r="2.6" fill="' + col + '"/>');
+
+    // labels
+    o.push('<text x="' + (X + PAD) + '" y="' + (Y + 12) + '" font-size="9.5" font-weight="700" fill="' + INK +
+           '">' + esc(clip(c.creative, Math.max(10, Math.floor(iw / 5.4)))) + '</text>');
+    o.push('<text x="' + (X + PAD) + '" y="' + (Y + 22) + '" font-size="8.5" fill="' + MUTED + '">' +
+           esc(clip(c.brand + " · " + c.channel, Math.max(10, Math.floor(iw / 4.6)))) + '</text>');
+    o.push('<text x="' + (X + PW - PAD) + '" y="' + (Y + 13) + '" font-size="11.5" font-weight="700" fill="' + col +
+           '" text-anchor="end">' + last.roas.toFixed(2) + '</text>');
+    o.push('<text x="' + (X + PW - PAD) + '" y="' + (Y + 22) + '" font-size="8" font-weight="600" fill="' + col +
+           '" text-anchor="end">' + c.status.toUpperCase() + '</text>');
+    o.push('<text x="' + (X + PAD) + '" y="' + (Y + PH - 3) + '" font-size="8" fill="' + GREY + '">d0</text>');
+    o.push('<text x="' + (X + PAD + iw) + '" y="' + (Y + PH - 3) + '" font-size="8" fill="' + GREY +
+           '" text-anchor="end">d' + maxDay + ' · ' + eur(last.spend) + '/day</text>');
+
+    o.push('<rect class="hit" data-i="' + idx + '" x="' + X + '" y="' + Y + '" width="' + PW +
+           '" height="' + PH + '" fill="transparent"/>');
+    o.push('</g>');
+    return o.join("");
+  }
+
+  function onMove(ev) {
+    var c = creatives[Number(ev.target.getAttribute("data-i"))];
+    if (!c) return;
+    var last = c.pts[c.pts.length - 1], cd = crossDay(c);
+    tip.innerHTML = "<b>" + esc(c.creative) + "</b><br>" + esc(c.brand) +
+      (c.channel ? " · " + esc(c.channel) : "") + "<br>" +
+      "launched at " + c.pts[0].roas.toFixed(2) + " ROAS, now " + last.roas.toFixed(2) +
+      "<br>break-even " + c.be.toFixed(2) + " (1 ÷ gross margin)<br>" +
+      (cd === null ? "still above break-even" : "crossed below on day " + cd) +
+      "<br>" + eur(last.spend) + " spend/day · " + c.status;
+    tip.style.opacity = 1;
+    var W = stage.clientWidth;
+    var left = ev.clientX + 12, tw = tip.offsetWidth;
+    if (left + tw > W - 6) left = ev.clientX - tw - 12;
+    tip.style.left = left + "px";
+    tip.style.top = (ev.clientY + 12) + "px";
+  }
+  function onLeave() { tip.style.opacity = 0; }
+
+  // ResizeObserver on the STAGE, not a window resize listener -- the tile is
+  // resized by its Sigma container, which never fires a window resize.
+  if (window.ResizeObserver) new ResizeObserver(render).observe(stage);
+  creatives = synth();
+  render();
+
+  // The UMD bundle exposes itself FLAT on window.SigmaPlugin: its exports are
+  // `client`, `SigmaClientProvider`, `polyfillRequestAnimationFrame` and the
+  // React hooks. There is NO `plugin` property, so the documented
+  // `window.sigmaComputing.plugin.client` shape is undefined, the reference
+  // throws on the first line, and the tile paints the unbound fallback for
+  // ever while looking almost right.
+  var SP = window.SigmaPlugin || window.sigmaComputing;
+  var client = SP && (SP.client || (SP.plugin && SP.plugin.client));
+  if (!client) { state = "SDK not loaded"; render(); return; }
+
+  client.config.configureEditorPanel([
+    { name: "source", type: "element" },
+    { name: "creative", type: "column", source: "source", allowedTypes: ["text"], label: "Creative" },
+    { name: "brand", type: "column", source: "source", allowedTypes: ["text"], label: "Brand" },
+    { name: "channel", type: "column", source: "source", allowedTypes: ["text"], label: "Channel" },
+    { name: "day", type: "column", source: "source", allowedTypes: ["number"], label: "Day" },
+    { name: "roas", type: "column", source: "source", allowedTypes: ["number"], label: "ROAS" },
+    { name: "spend", type: "column", source: "source", allowedTypes: ["number"], label: "Spend" },
+    { name: "breakeven", type: "column", source: "source", allowedTypes: ["number"], label: "Break Even" },
+    { name: "status", type: "column", source: "source", allowedTypes: ["text"], label: "Status" }
+  ]);
+
+  var unsub = null;
+  client.config.subscribe(function (cfg) {
+    if (unsub) { try { unsub(); } catch (e) {} unsub = null; }
+    if (!cfg || !cfg.source) {
+      state = "no config"; diag = ""; creatives = synth(); render(); return;
+    }
+    state = "awaiting data"; diag = ""; render();
+    unsub = client.elements.subscribeToElementData(cfg.source, function (data) {
+      var next = toCreatives(data, cfg);
+      if (next && next.length) {
+        state = "bound"; diag = ""; creatives = next;
+      } else {
+        // name what actually arrived: if the keys are not the configured
+        // column ids, the tile looks identical to a slow load
+        state = "no rows";
+        diag = data ? Object.keys(data).slice(0, 4).join(",") : "no data";
+        creatives = synth();
+      }
+      render();
+    });
+  });
+})();
+</script>
+</body>
+</html>
